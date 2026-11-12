@@ -17,26 +17,53 @@ func TestRenderScreenshot(t *testing.T) {
 		{Name: "/dev/cu.usbmodem1101", Base: "usbmodem1101", Chip: "CDC-ACM"},
 	}
 	s := a.activeSession()
+	s.name = "调试串口"
 	s.portSel = a.ports[0].label()
-	s.rxRecords = []rxRecord{
-		{id: 1, ts: time.Now(), dir: dirRX, data: []byte("Hello from MCU\r\n")},
-		{id: 2, ts: time.Now(), dir: dirTX, data: []byte("AT+GMR")},
-		{id: 3, ts: time.Now(), dir: dirRX, data: []byte{0xAA, 0x55, 0x03, 0xFF, 0x10, 0x20, 0x30}},
-		{id: 4, ts: time.Now(), dir: dirSYS, data: []byte("串口已打开 /dev/cu.wchusbserial-1410 @ 115200 bps")},
-		{id: 5, ts: time.Now(), dir: dirRX, data: []byte("temp=25.3 humi=60\n")},
-	}
+	s.opened = true
+	s.devName = "/dev/cu.wchusbserial-1410"
+	s.cts, s.dsr = true, true
+	s.status = "已连接 wchusbserial-1410 @ 115200 bps"
+	s.statusKind = 1
 	s.showTS = true
-	s.rxCount = 42
-	s.txCount = 8
-	s.sendText = "AT+GMR"
-	a.newSession()
+	now := time.Now()
+	lines := []struct {
+		dir  int
+		data string
+	}{
+		{dirSYS, "串口已打开 /dev/cu.wchusbserial-1410 @ 115200 bps, 8/None/1"},
+		{dirRX, "dram_bist_test start\r\n"},
+		{dirRX, "[stage 4] sdram_init() returned\r\n"},
+		{dirRX, "[stage 5] external DDR software memory test @0x03000000 (16 MiB)...\r\n"},
+		{dirRX, "[stage 5] memory test done, total errors=0\r\n"},
+		{dirRX, "[stage 6] restoring DDR image from DLM backup...\r\n"},
+		{dirTX, "AT+CGSN"},
+		{dirRX, "862419050012345\r\n"},
+		{dirRX, "[stage 7] resumed in DDR code, main=0x0290045c\r\n"},
+		{dirRX, "[stage 8] PASS: total errors=0\r\n"},
+		{dirRX, "==== ALL DONE stage=8 errors=0 done=0x900d900d ====\r\n"},
+		{dirTX, "dram_bist_test"},
+	}
+	for i, l := range lines {
+		s.rxRecords = append(s.rxRecords, rxRecord{
+			id: i + 1, ts: now.Add(time.Duration(i) * 80 * time.Millisecond),
+			dir: l.dir, data: []byte(l.data),
+		})
+	}
+	s.rxCount = 1024
+	s.txCount = 22
+	s.sendText = "sysinfo"
+
+	s2 := a.newSession()
+	s2.name = "Modem"
+	s2.portSel = a.ports[2].label()
 	a.active = 0
+
 	for _, dark := range []bool{true, false} {
 		a.dark = dark
 		img := ui.Render(a.view, 1280, 800, 2)
-		name := "/tmp/serialcomm_render_dark.png"
+		name := "docs/screenshot.png"
 		if !dark {
-			name = "/tmp/serialcomm_render_light.png"
+			name = "docs/screenshot-light.png"
 		}
 		f, err := os.Create(name)
 		if err != nil {
