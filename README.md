@@ -1,5 +1,7 @@
 # SerialComm
 
+<img src="docs/icon.png" width="128" align="right">
+
 [![CI](https://github.com/xixijay1988/SerialComm/actions/workflows/ci.yml/badge.svg)](https://github.com/xixijay1988/SerialComm/actions/workflows/ci.yml)
 
 A serial port debugging tool for macOS in the spirit of SSCOM — written
