@@ -670,7 +670,11 @@ func (s *session) updateSnap() {
 }
 
 func parseInterval(str string) time.Duration {
-	n, _ := strconv.Atoi(strings.Fields(str)[0])
+	f := strings.Fields(str)
+	if len(f) == 0 {
+		return 0
+	}
+	n, _ := strconv.Atoi(f[0])
 	return time.Duration(n) * time.Millisecond
 }
 

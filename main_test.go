@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"strings"
 	"testing"
 
 	"github.com/egoist/mygo/ui"
@@ -198,5 +200,194 @@ func TestAppendRecordMergesLineAcrossReads(t *testing.T) {
 	s.appendRecord(dirTX, []byte("OK"))
 	if len(s.rxRecords) != 8 {
 		t.Fatalf("records = %d, want 8", len(s.rxRecords))
+	}
+}
+
+func TestParseInterval(t *testing.T) {
+	cases := map[string]int64{
+		"500 ms": 500,
+		"1000":   1000,
+		"250 毫秒": 250,
+		"":       0, // empty must not panic
+		"abc ms": 0,
+	}
+	for in, want := range cases {
+		if got := parseInterval(in).Milliseconds(); got != want {
+			t.Errorf("parseInterval(%q) = %d ms, want %d", in, got, want)
+		}
+	}
+}
+
+func TestPrintable(t *testing.T) {
+	if got := printable([]byte("hello\t世界")); got != "hello\t世界" {
+		t.Errorf("printable utf8 = %q", got)
+	}
+	// Invalid UTF-8 and control bytes become '.', \r\n survive.
+	if got := printable([]byte{0x00, 0xFF, 0xFE, 'a', '\r', '\n'}); got != "...a\r\n" {
+		t.Errorf("printable binary = %q", got)
+	}
+}
+
+func TestFilterRecords(t *testing.T) {
+	a := newTestApp()
+	s := a.activeSession()
+	s.rxRecords = []rxRecord{
+		{id: 1, dir: dirRX, data: []byte("hello\n")},
+		{id: 2, dir: dirTX, data: []byte("AT")},
+		{id: 3, dir: dirSYS, data: []byte("opened")},
+		{id: 4, dir: dirRX, data: []byte("world\n")},
+	}
+	s.showTX = false
+	s.filterRecords()
+	if len(s.filtered) != 3 {
+		t.Fatalf("filtered = %d, want 3 (TX hidden)", len(s.filtered))
+	}
+	s.query = "HELLO"
+	s.filterRecords()
+	if len(s.filtered) != 1 || s.filtered[0].id != 1 {
+		t.Fatalf("search filtered = %#v", s.filtered)
+	}
+	// Search matches HEX text too in HEX mode.
+	s.dispMode = 1
+	s.query = "68 65" // "he"
+	s.filterRecords()
+	if len(s.filtered) != 1 || s.filtered[0].id != 1 {
+		t.Fatalf("hex search filtered = %#v", s.filtered)
+	}
+}
+
+func TestRecordTextModes(t *testing.T) {
+	a := newTestApp()
+	s := a.activeSession()
+	r := rxRecord{id: 1, dir: dirRX, data: []byte("AB\r\n")}
+	s.dispMode = 1
+	if got := s.recordText(r); got != "41 42 0D 0A" {
+		t.Fatalf("hex mode = %q", got)
+	}
+	s.dispMode = 2
+	got := s.recordText(r)
+	if !strings.HasPrefix(got, "AB") || !strings.Contains(got, "41 42") {
+		t.Fatalf("mixed mode = %q", got)
+	}
+	// SYS records ignore display mode.
+	s.dispMode = 1
+	r.dir = dirSYS
+	if got := s.recordText(r); got != "AB" {
+		t.Fatalf("sys text = %q", got)
+	}
+}
+
+func TestPayloadSuffixBeforeChecksum(t *testing.T) {
+	// Checksum covers data + line ending, per Modbus convention.
+	b, err := payload(sendSnap{text: "01 06 00 01 00 01", hex: true,
+		checksum: "CRC16-Modbus"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := appendChecksum(appendChecksum(
+		[]byte{0x01, 0x06, 0x00, 0x01, 0x00, 0x01}, "None"), "CRC16-Modbus")
+	if string(b) != string(want) {
+		t.Fatalf("payload = % X, want % X", b, want)
+	}
+	// Suffix applied before checksum.
+	b, err = payload(sendSnap{text: "AA", hex: true,
+		suffix: "CRLF (\\r\\n)", checksum: "XOR8"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want2 := xor8([]byte{0xAA, '\r', '\n'})
+	if len(b) != 4 || b[3] != want2[0] {
+		t.Fatalf("payload = % X", b)
+	}
+	// Bad hex must error, not send.
+	if _, err := payload(sendSnap{text: "ZZ", hex: true}); err == nil {
+		t.Error("bad hex should error")
+	}
+}
+
+func TestAppendChecksumUnknown(t *testing.T) {
+	in := []byte{1, 2, 3}
+	if got := appendChecksum(in, "None"); string(got) != string(in) {
+		t.Fatalf("None = %v", got)
+	}
+	if got := appendChecksum(in, "bogus"); string(got) != string(in) {
+		t.Fatalf("unknown kind = %v", got)
+	}
+}
+
+func TestAppendRecordCaps(t *testing.T) {
+	a := newTestApp()
+	s := a.activeSession()
+	// A chunk larger than maxRecordBytes splits into two records, the
+	// first capped and open, the second taking the rest with its newline.
+	big := append(bytes.Repeat([]byte{'x'}, maxRecordBytes+10), '\n')
+	s.appendRecord(dirRX, big)
+	if len(s.rxRecords) != 2 {
+		t.Fatalf("records = %d, want 2", len(s.rxRecords))
+	}
+	if len(s.rxRecords[0].data) != maxRecordBytes {
+		t.Fatalf("record 0 len = %d, want %d", len(s.rxRecords[0].data), maxRecordBytes)
+	}
+	if got := string(s.rxRecords[1].data); got != "xxxxxxxxxx\n" {
+		t.Fatalf("record 1 = %q", got)
+	}
+	// LF-only input splits per line.
+	s.rxRecords = nil
+	s.appendRecord(dirRX, []byte("a\nb\nc"))
+	if len(s.rxRecords) != 3 {
+		t.Fatalf("records = %d, want 3", len(s.rxRecords))
+	}
+	// Records beyond maxRXRecords are evicted from the front.
+	s.rxRecords = nil
+	base := s.nextRecID
+	for i := 0; i < maxRXRecords+10; i++ {
+		s.appendRecord(dirRX, []byte("x\n"))
+	}
+	if len(s.rxRecords) != maxRXRecords {
+		t.Fatalf("records = %d, want capped at %d", len(s.rxRecords), maxRXRecords)
+	}
+	if s.rxRecords[0].id != base+11 {
+		t.Fatalf("oldest kept id = %d, want %d", s.rxRecords[0].id, base+11)
+	}
+}
+
+func TestPortInUse(t *testing.T) {
+	a := newTestApp()
+	s1 := a.activeSession()
+	s1.devName = "/dev/cu.usbserial-1"
+	s1.opened = true
+	s2 := a.newSession()
+	if got := a.portInUse("/dev/cu.usbserial-1", s2); got != s1 {
+		t.Fatal("portInUse did not find s1")
+	}
+	// A session does not conflict with itself; closed ports don't count.
+	if a.portInUse("/dev/cu.usbserial-1", s1) != nil {
+		t.Fatal("self-conflict reported")
+	}
+	s1.opened = false
+	if a.portInUse("/dev/cu.usbserial-1", s2) != nil {
+		t.Fatal("closed port reported as in use")
+	}
+}
+
+func TestGroupCommands(t *testing.T) {
+	a := newTestApp()
+	a.customCmds[a.cmdGroup] = []quickCmd{{"mine", "mycmd"}}
+	got := a.groupCommands()
+	if len(got) != len(cmdGroups[a.cmdGroup])+1 || got[len(got)-1].Value != "mycmd" {
+		t.Fatalf("groupCommands = %#v", got)
+	}
+}
+
+func TestSendNowNoPort(t *testing.T) {
+	a := newTestApp()
+	s := a.activeSession()
+	s.sendText = "AT"
+	s.sendNow()
+	if s.txCount != 0 || len(s.rxRecords) != 0 {
+		t.Fatalf("sendNow without port: tx=%d records=%d", s.txCount, len(s.rxRecords))
+	}
+	if s.status != "发送失败: 串口未打开" {
+		t.Fatalf("status = %q", s.status)
 	}
 }

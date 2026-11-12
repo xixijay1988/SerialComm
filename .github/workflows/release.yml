@@ -1,0 +1,48 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  dmg:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test before packaging
+        run: go test ./...
+
+      - name: Set app version from tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          python3 - "$VERSION" <<'PY'
+          import json, sys
+          p = "mygo.json"
+          cfg = json.load(open(p))
+          cfg["version"] = sys.argv[1]
+          json.dump(cfg, open(p, "w"), indent=2, ensure_ascii=False)
+          PY
+          cat mygo.json
+
+      - name: Build app and DMG
+        run: go tool mygo build
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/darwin-arm64/*.dmg
+          generate_release_notes: true
+          body: |
+            macOS (Apple Silicon) 版 SerialComm。
+
+            应用为 ad-hoc 签名，首次打开若被 Gatekeeper 拦截：
+            右键 → 打开，或运行 `xattr -dr com.apple.quarantine SerialComm.app`。
