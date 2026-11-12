@@ -518,22 +518,40 @@ func (s *session) readLoop(p serial.Port) {
 // becoming an empty or partial row.
 func (s *session) appendRecord(dir int, data []byte) {
 	for len(data) > 0 {
+		merged := false
 		if n := len(s.rxRecords); n > 0 {
 			last := &s.rxRecords[n-1]
-			open := last.dir == dir && dir == dirRX && len(last.data) < maxRecordBytes &&
-				(len(last.data) == 0 || last.data[len(last.data)-1] != '\n')
-			if open {
-				m := maxRecordBytes - len(last.data)
-				if m > len(data) {
-					m = len(data)
+			if last.dir == dir && dir == dirRX && len(last.data) < maxRecordBytes {
+				var m int
+				if len(last.data) == 0 || last.data[len(last.data)-1] != '\n' {
+					// Unfinished line: continue it up to the next newline.
+					m = maxRecordBytes - len(last.data)
+					if m > len(data) {
+						m = len(data)
+					}
+					if i := bytes.IndexByte(data[:m], '\n'); i >= 0 {
+						m = i + 1
+					}
+				} else {
+					// Completed line: absorb only a leading run of line
+					// terminators — a '\n' or "\r\n" stranded by a read
+					// boundary must not become an empty row.
+					for m < len(data) && (data[m] == '\r' || data[m] == '\n') {
+						m++
+					}
+					if room := maxRecordBytes - len(last.data); m > room {
+						m = room
+					}
 				}
-				if i := bytes.IndexByte(data[:m], '\n'); i >= 0 {
-					m = i + 1
+				if m > 0 {
+					last.data = append(last.data, data[:m]...)
+					data = data[m:]
+					merged = true
 				}
-				last.data = append(last.data, data[:m]...)
-				data = data[m:]
-				continue
 			}
+		}
+		if merged {
+			continue
 		}
 		n := len(data)
 		if i := bytes.IndexByte(data, '\n'); i >= 0 {
@@ -559,21 +577,24 @@ func (s *session) sysLog(msg string) {
 
 // recordText renders one record under the current display mode.
 func (s *session) recordText(r rxRecord) string {
+	// A record's trailing line terminator belongs to the stream, not the
+	// line shown: left in, it renders an empty line inside the row.
+	data := bytes.TrimRight(r.data, "\r\n")
 	if r.dir == dirSYS {
-		return printable(r.data)
+		return printable(data)
 	}
 	switch s.dispMode {
 	case 1:
 		return hexDump(r.data, 16)
 	case 2:
-		text := printable(r.data)
+		text := printable(data)
 		h := hexDump(r.data, 0)
 		if len(h) > 64 {
 			h = h[:64] + " …"
 		}
 		return text + "   │  " + h
 	default:
-		return printable(r.data)
+		return printable(data)
 	}
 }
 
