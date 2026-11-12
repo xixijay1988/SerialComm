@@ -412,6 +412,9 @@ func (s *session) togglePort() {
 		s.setStatus("打开失败: "+err.Error(), 2)
 		return
 	}
+	// The driver has been buffering whatever the device sent while the
+	// port was closed; drop it so the console starts at the live stream.
+	_ = port.ResetInputBuffer()
 	s.portMu.Lock()
 	s.port = port
 	s.opened = true
