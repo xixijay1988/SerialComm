@@ -5,6 +5,7 @@ import (
 	"log"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -24,23 +25,45 @@ var baudRates = []string{
 	"460800", "500000", "576000", "921600", "1000000", "1500000", "2000000",
 }
 
-var suffixes = []string{"None", "\\r", "\\n", "\\r\\n", "\\n\\r"}
+var (
+	suffixes  = []string{"None", "CR (\\r)", "LF (\\n)", "CRLF (\\r\\n)"}
+	intervals = []string{"50 ms", "100 ms", "200 ms", "500 ms", "1000 ms", "2000 ms", "5000 ms", "10000 ms"}
+)
 
-// rxRecord is one batch of bytes received from the port.
+// record direction tags
+const (
+	dirRX  = iota // received data
+	dirTX         // sent data echo
+	dirSYS        // system messages (open/close/error)
+)
+
+// rxRecord is one line in the console.
 type rxRecord struct {
 	id   int
 	ts   time.Time
+	dir  int
 	data []byte
 }
 
+// sendSnap is a mutex-protected copy of the send configuration the
+// periodic goroutine uses, so it never reads view fields directly.
+type sendSnap struct {
+	text     string
+	hex      bool
+	suffix   string
+	checksum string
+	periodic bool
+	interval time.Duration
+}
+
 // app is the state the window shows. All fields are touched on the main
-// thread only, except pending/snapshot which are mutex protected.
+// thread only, except pending/snap which are mutex protected.
 type app struct {
 	win atomic.Pointer[mygo.Window]
 
 	// port configuration
 	ports    []portInfo
-	portSel  string // label of the selected port
+	portSel  string
 	baud     string
 	dataBits string
 	parity   string
@@ -53,16 +76,25 @@ type app struct {
 	portMu  sync.Mutex // guards port + opened
 	opened  bool
 	devName string // device path of the open port
+	cts     bool
+	dsr     bool
 
 	refreshing atomic.Bool
 
-	// receive
+	// console
 	rxList    ui.ListState
 	rxRecords []rxRecord
+	filtered  []rxRecord
 	nextRecID int
-	dispMode  int // 0 text, 1 hex
+	dispMode  int // 0 text, 1 hex, 2 mixed
+	showRX    bool
+	showTX    bool
 	showTS    bool
 	paused    bool
+	autofollow bool
+	query     string
+	searchH   ui.Handle
+	wantFocus bool
 	rxCount   int
 	txCount   int
 
@@ -70,169 +102,51 @@ type app struct {
 	pending   []byte
 	scheduled bool
 
-	// send
-	sendText string
-	sendHex  bool
-	suffix   string
-	periodic bool
-	periodMs float64
+	// send / composer
+	sendText   string
+	sendHex    bool
+	suffix     string
+	checksum   string
+	periodic   bool
+	interval   string
+	composeTab int
 
 	snapMu sync.Mutex // guards snap
 	snap   sendSnap
 
+	// right panel / commands
+	showPanel  bool
+	rightTab   int
+	cmdGroup   string
+	customCmds map[string][]quickCmd
+	addOpen    bool
+	addName    string
+	addValue   string
+
+	dark       bool
 	status     string
 	statusKind int // 0 muted, 1 success, 2 danger
 }
 
-// sendSnap is a mutex-protected copy of the send configuration the
-// periodic goroutine uses, so it never reads view fields directly.
-type sendSnap struct {
-	text     string
-	hex      bool
-	suffix   string
-	periodic bool
-	interval time.Duration
-}
-
-func (a *app) view(c *ui.Context) {
-	t := c.Theme()
-	ui.Column(c).Fill().Gap(8).Padding(10).Children(func() {
-		a.viewConfig(c)
-		a.viewStatusLine(c, t)
-		a.viewReceive(c)
-		a.viewReceiveBar(c, t)
-		a.viewSend(c)
-	})
-}
-
-// viewConfig is the row of port parameters, as in SSCOM.
-func (a *app) viewConfig(c *ui.Context) {
-	t := c.Theme()
-	ui.Row(c).FillWidth().Gap(8).AlignItems(ui.Center).Children(func() {
-		labels := make([]string, len(a.ports))
-		for i, p := range a.ports {
-			labels[i] = p.label()
-		}
-		ui.Select(c, &a.portSel, labels).
-			Label("Port").MinWidth(280).Grow(1).Disabled(a.opened)
-		ui.Button(c, "Refresh").OnClick(a.refreshPortsAsync)
-		ui.Checkbox(c, &a.dtr, "DTR").Disabled(!a.opened).
-			OnChange(func() { a.setModemBits() })
-		ui.Checkbox(c, &a.rts, "RTS").Disabled(!a.opened).
-			OnChange(func() { a.setModemBits() })
-		ui.Spacer(c).Grow(1)
-		open := ui.PrimaryButton(c, "Open")
-		if a.opened {
-			open = ui.PrimaryButton(c, "Close")
-		}
-		open.MinWidth(96).OnClick(a.togglePort)
-	})
-	ui.Row(c).FillWidth().Gap(8).AlignItems(ui.Center).Children(func() {
-		ui.Text(c, "Baud").TextColor(t.TextMuted)
-		ui.Combobox(c, &a.baud, baudRates).
-			Label("Baud rate").Width(100).
-			OnChange(a.applyMode)
-		ui.Text(c, "Data").TextColor(t.TextMuted)
-		ui.Select(c, &a.dataBits, []string{"5", "6", "7", "8"}).
-			Label("Data bits").Width(64).
-			OnChange(a.applyMode)
-		ui.Text(c, "Parity").TextColor(t.TextMuted)
-		ui.Select(c, &a.parity, []string{"None", "Odd", "Even", "Mark", "Space"}).
-			Label("Parity").Width(88).
-			OnChange(a.applyMode)
-		ui.Text(c, "Stop").TextColor(t.TextMuted)
-		ui.Select(c, &a.stopBits, []string{"1", "1.5", "2"}).
-			Label("Stop bits").Width(64).
-			OnChange(a.applyMode)
-	})
-}
-
-// viewStatusLine shows the port state, byte counters and a message.
-func (a *app) viewStatusLine(c *ui.Context, t *ui.Theme) {
-	ui.Row(c).FillWidth().Gap(10).AlignItems(ui.Center).Children(func() {
-		state, color := "Closed", t.TextMuted
-		if a.opened {
-			state, color = "Opened: "+a.devName, t.Success
-		}
-		ui.Text(c, state).TextColor(color)
-		ui.Textf(c, "RX: %d   TX: %d", a.rxCount, a.txCount).
-			TextColor(t.TextMuted)
-		ui.Button(c, "Reset counters").OnClick(func() {
-			a.rxCount, a.txCount = 0, 0
-		})
-		ui.Spacer(c).Grow(1)
-		sc := t.TextMuted
-		switch a.statusKind {
-		case 1:
-			sc = t.Success
-		case 2:
-			sc = t.Danger
-		}
-		ui.Text(c, a.status).TextColor(sc).SingleLine()
-	})
-}
-
-// viewReceive is the scrolling receive area.
-func (a *app) viewReceive(c *ui.Context) {
-	a.rxList.FollowEnd = true
-	a.rxList.Key = func(row int) any { return a.rxRecords[row].id }
-	ui.List(c, &a.rxList, len(a.rxRecords), func(i int) {
-		ui.Text(c, a.recordText(a.rxRecords[i])).
-			Font("monospace").FontSize(12).Selectable()
-	}).Fill().Border(1, c.Theme().Border).Radius(6)
-}
-
-// viewReceiveBar holds the display options under the receive area.
-func (a *app) viewReceiveBar(c *ui.Context, t *ui.Theme) {
-	ui.Row(c).FillWidth().Gap(10).AlignItems(ui.Center).Children(func() {
-		ui.Segmented(c, &a.dispMode, "Text", "HEX").Label("Display format")
-		ui.Checkbox(c, &a.showTS, "Timestamp")
-		ui.Checkbox(c, &a.paused, "Pause")
-		ui.Spacer(c).Grow(1)
-		ui.Button(c, "Clear").OnClick(func() {
-			a.rxRecords = nil
-		})
-		ui.Button(c, "Save…").OnClick(a.saveLog)
-	})
-}
-
-// viewSend is the send input and its options.
-func (a *app) viewSend(c *ui.Context) {
-	ui.TextArea(c, &a.sendText).
-		Placeholder("Data to send…").
-		Label("Data to send").
-		MinHeight(64).MaxHeight(110).FillWidth().
-		OnChange(a.updateSnap)
-	ui.Row(c).FillWidth().Gap(10).AlignItems(ui.Center).Children(func() {
-		ui.Checkbox(c, &a.sendHex, "HEX").Label("Send as hex").
-			OnChange(a.updateSnap)
-		ui.Select(c, &a.suffix, suffixes).
-			Label("Append").Width(96).
-			OnChange(a.updateSnap)
-		ui.Checkbox(c, &a.periodic, "Periodic").Label("Periodic send").
-			OnChange(a.updateSnap)
-		ui.NumberInput(c, &a.periodMs, 20, 3600000, 50).
-			Label("Interval ms").Width(100).
-			OnChange(a.updateSnap)
-		ui.Text(c, "ms").TextColor(c.Theme().TextMuted)
-		ui.Spacer(c).Grow(1)
-		ui.PrimaryButton(c, "Send").MinWidth(96).
-			Disabled(!a.opened).
-			OnClick(a.sendNow)
-	})
-}
-
 func main() {
 	a := &app{
-		baud:     "115200",
-		dataBits: "8",
-		parity:   "None",
-		stopBits: "1",
-		dtr:      true,
-		rts:      true,
-		suffix:   "None",
-		periodMs: 1000,
-		status:   "Select a port",
+		baud:       "115200",
+		dataBits:   "8",
+		parity:     "None",
+		stopBits:   "1",
+		dtr:        true,
+		rts:        true,
+		suffix:     "None",
+		checksum:   "None",
+		interval:   "1000 ms",
+		showRX:     true,
+		showTX:     true,
+		autofollow: true,
+		showPanel:  true,
+		dark:       true,
+		cmdGroup:   cmdGroupNames[0],
+		customCmds: map[string][]quickCmd{},
+		status:     "请选择串口设备",
 	}
 	a.setPorts(listPortsQuick())
 	go a.watchPorts()
@@ -240,10 +154,10 @@ func main() {
 	mygo.App.WhenReady(func() {
 		a.win.Store(mygo.NewWindow(mygo.WindowOptions{
 			Title:     "SerialComm",
-			Width:     920,
-			Height:    640,
-			MinWidth:  720,
-			MinHeight: 480,
+			Width:     1180,
+			Height:    760,
+			MinWidth:  900,
+			MinHeight: 620,
 			StateKey:  "main",
 			Content:   ui.View(a.view),
 		}))
@@ -253,6 +167,18 @@ func main() {
 	if err := mygo.App.Run(); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// portLabels returns the select options for the current port list.
+func (a *app) portLabels() []string {
+	labels := make([]string, len(a.ports))
+	for i, p := range a.ports {
+		labels[i] = p.label()
+	}
+	if len(labels) == 0 {
+		labels = []string{"无可用串口"}
+	}
+	return labels
 }
 
 // --- port management -------------------------------------------------
@@ -294,7 +220,8 @@ func (a *app) refreshPortsAsync() {
 			a.setPorts(ports)
 			if gone {
 				a.closePort()
-				a.setStatus("Port removed", 2)
+				a.setStatus("端口已被拔出", 2)
+				a.sysLog("port removed: " + a.devName)
 			}
 		})
 	}()
@@ -315,11 +242,31 @@ func (a *app) watchPorts() {
 	var last []string
 	for range time.Tick(1500 * time.Millisecond) {
 		names := portNames()
-		if slices.Equal(names, last) {
-			continue
+		if !slices.Equal(names, last) {
+			last = names
+			a.refreshPortsAsync()
 		}
-		last = names
-		a.refreshPortsAsync()
+		a.pollModemBits()
+	}
+}
+
+// pollModemBits reads CTS/DSR while the port is open.
+func (a *app) pollModemBits() {
+	a.portMu.Lock()
+	p := a.port
+	a.portMu.Unlock()
+	if p == nil {
+		return
+	}
+	bits, err := p.GetModemStatusBits()
+	if err != nil {
+		return
+	}
+	if w := a.win.Load(); w != nil {
+		w.Update(func() {
+			a.cts = bits.CTS
+			a.dsr = bits.DSR
+		})
 	}
 }
 
@@ -335,12 +282,13 @@ func (a *app) selectedPort() *portInfo {
 func (a *app) togglePort() {
 	if a.opened {
 		a.closePort()
-		a.setStatus("Closed", 0)
+		a.setStatus("已断开", 0)
+		a.sysLog("串口已断开")
 		return
 	}
 	p := a.selectedPort()
 	if p == nil {
-		a.setStatus("No port selected", 2)
+		a.setStatus("未选择串口", 2)
 		return
 	}
 	mode, err := portMode(a.baud, a.dataBits, a.parity, a.stopBits)
@@ -350,7 +298,7 @@ func (a *app) togglePort() {
 	}
 	port, err := serial.Open(p.Name, mode)
 	if err != nil {
-		a.setStatus("Open failed: "+err.Error(), 2)
+		a.setStatus("打开失败: "+err.Error(), 2)
 		return
 	}
 	a.portMu.Lock()
@@ -360,7 +308,9 @@ func (a *app) togglePort() {
 	a.portMu.Unlock()
 	_ = port.SetDTR(a.dtr)
 	_ = port.SetRTS(a.rts)
-	a.setStatus(fmt.Sprintf("%s @ %d baud", p.Name, mode.BaudRate), 1)
+	a.setStatus(fmt.Sprintf("已连接 %s @ %d bps", p.Base, mode.BaudRate), 1)
+	a.sysLog(fmt.Sprintf("串口已打开 %s @ %d bps, %s/%s/%s",
+		p.Name, mode.BaudRate, a.dataBits, a.parity, a.stopBits))
 	go a.readLoop(port)
 }
 
@@ -372,6 +322,7 @@ func (a *app) closePort() {
 		a.port = nil
 	}
 	a.opened = false
+	a.cts, a.dsr = false, false
 }
 
 // applyMode re-configures the open port after a parameter change.
@@ -387,10 +338,10 @@ func (a *app) applyMode() {
 		return
 	}
 	if err := a.port.SetMode(mode); err != nil {
-		a.setStatus("Set mode: "+err.Error(), 2)
+		a.setStatus("参数设置失败: "+err.Error(), 2)
 		return
 	}
-	a.setStatus(fmt.Sprintf("%d baud", mode.BaudRate), 1)
+	a.setStatus(fmt.Sprintf("%d bps", mode.BaudRate), 1)
 }
 
 func (a *app) setModemBits() {
@@ -428,13 +379,7 @@ func (a *app) readLoop(p serial.Port) {
 					a.rxMu.Unlock()
 					a.rxCount += len(data)
 					if !a.paused {
-						a.nextRecID++
-						a.rxRecords = append(a.rxRecords, rxRecord{
-							id: a.nextRecID, ts: time.Now(), data: data,
-						})
-						if len(a.rxRecords) > maxRXRecords {
-							a.rxRecords = a.rxRecords[len(a.rxRecords)-maxRXRecords:]
-						}
+						a.appendRecord(dirRX, data)
 					}
 				})
 			}
@@ -446,7 +391,8 @@ func (a *app) readLoop(p serial.Port) {
 				a.portMu.Unlock()
 				if stillOpen {
 					a.closePort()
-					a.setStatus("Read error: "+err.Error(), 2)
+					a.setStatus("读取错误: "+err.Error(), 2)
+					a.sysLog("read error: " + err.Error())
 				}
 			})
 			return
@@ -454,38 +400,87 @@ func (a *app) readLoop(p serial.Port) {
 	}
 }
 
+// appendRecord adds a console line; main thread only.
+func (a *app) appendRecord(dir int, data []byte) {
+	a.nextRecID++
+	a.rxRecords = append(a.rxRecords, rxRecord{
+		id: a.nextRecID, ts: time.Now(), dir: dir, data: data,
+	})
+	if len(a.rxRecords) > maxRXRecords {
+		a.rxRecords = a.rxRecords[len(a.rxRecords)-maxRXRecords:]
+	}
+}
+
+func (a *app) sysLog(msg string) {
+	a.appendRecord(dirSYS, []byte(msg))
+}
+
+// recordText renders one record under the current display mode.
 func (a *app) recordText(r rxRecord) string {
-	var s strings.Builder
-	if a.showTS {
-		s.WriteString("[" + r.ts.Format("15:04:05.000") + "] ")
+	if r.dir == dirSYS {
+		return printable(r.data)
 	}
-	if a.dispMode == 1 {
-		s.WriteString(hexDump(r.data, 16))
-	} else {
-		s.WriteString(printable(r.data))
+	switch a.dispMode {
+	case 1:
+		return hexDump(r.data, 16)
+	case 2:
+		text := printable(r.data)
+		h := hexDump(r.data, 0)
+		if len(h) > 64 {
+			h = h[:64] + " …"
+		}
+		return text + "   │  " + h
+	default:
+		return printable(r.data)
 	}
-	return s.String()
+}
+
+// filterRecords applies the RX/TX toggles and the search query.
+func (a *app) filterRecords() {
+	q := strings.ToLower(a.query)
+	a.filtered = a.filtered[:0]
+	for _, r := range a.rxRecords {
+		switch r.dir {
+		case dirRX:
+			if !a.showRX {
+				continue
+			}
+		case dirTX:
+			if !a.showTX {
+				continue
+			}
+		}
+		if q != "" && !strings.Contains(strings.ToLower(a.recordText(r)), q) {
+			continue
+		}
+		a.filtered = append(a.filtered, r)
+	}
 }
 
 func (a *app) saveLog() {
 	path, err := mygo.Dialog.Save(mygo.SaveDialogOptions{
 		Parent:      a.win.Load(),
-		Title:       "Save received data",
-		DefaultPath: "serial-log.txt",
+		Title:       "保存日志",
+		DefaultPath: "serialcomm.log",
 	})
 	if err != nil || path == "" {
 		return
 	}
 	var s strings.Builder
 	for _, r := range a.rxRecords {
-		s.WriteString(a.recordText(r))
-		s.WriteByte('\n')
+		dir := "RX"
+		if r.dir == dirTX {
+			dir = "TX"
+		} else if r.dir == dirSYS {
+			dir = "SYS"
+		}
+		fmt.Fprintf(&s, "[%s] %s %s\n", r.ts.Format("15:04:05.000"), dir, a.recordText(r))
 	}
 	if err := os.WriteFile(path, []byte(s.String()), 0o644); err != nil {
-		a.setStatus("Save failed: "+err.Error(), 2)
+		a.setStatus("保存失败: "+err.Error(), 2)
 		return
 	}
-	a.setStatus("Saved: "+path, 1)
+	a.setStatus("已保存: "+path, 1)
 }
 
 // --- send ------------------------------------------------------------
@@ -497,12 +492,19 @@ func (a *app) updateSnap() {
 		text:     a.sendText,
 		hex:      a.sendHex,
 		suffix:   a.suffix,
+		checksum: a.checksum,
 		periodic: a.periodic,
-		interval: time.Duration(a.periodMs) * time.Millisecond,
+		interval: parseInterval(a.interval),
 	}
 }
 
-// payload builds the bytes to send from a sendSnap.
+func parseInterval(s string) time.Duration {
+	n, _ := strconv.Atoi(strings.Fields(s)[0])
+	return time.Duration(n) * time.Millisecond
+}
+
+// payload builds the bytes to send from a sendSnap: data, line ending,
+// then the checksum over everything.
 func payload(s sendSnap) ([]byte, error) {
 	var data []byte
 	if s.hex {
@@ -515,17 +517,16 @@ func payload(s sendSnap) ([]byte, error) {
 		data = []byte(s.text)
 	}
 	switch s.suffix {
-	case "\\r":
+	case "CR (\\r)":
 		data = append(data, '\r')
-	case "\\n":
+	case "LF (\\n)":
 		data = append(data, '\n')
-	case "\\r\\n":
+	case "CRLF (\\r\\n)":
 		data = append(data, '\r', '\n')
-	case "\\n\\r":
-		data = append(data, '\n', '\r')
 	}
+	data = appendChecksum(data, s.checksum)
 	if len(data) == 0 {
-		return nil, fmt.Errorf("nothing to send")
+		return nil, fmt.Errorf("请输入要发送的数据")
 	}
 	return data, nil
 }
@@ -534,22 +535,32 @@ func (a *app) sendNow() {
 	a.updateSnap()
 	data, err := payload(a.snap)
 	if err != nil {
-		a.setStatus("Send: "+err.Error(), 2)
+		a.setStatus("发送失败: "+err.Error(), 2)
 		return
 	}
-	a.portMu.Lock()
-	defer a.portMu.Unlock()
-	if a.port == nil {
-		a.setStatus("Port not open", 2)
-		return
-	}
-	n, err := a.port.Write(data)
+	n, err := a.writePort(data)
 	if err != nil {
-		a.setStatus("Send: "+err.Error(), 2)
+		a.setStatus("发送失败: "+err.Error(), 2)
 		return
 	}
 	a.txCount += n
-	a.setStatus(fmt.Sprintf("Sent %d bytes", n), 1)
+	a.appendRecord(dirTX, data)
+	a.setStatus(fmt.Sprintf("已发送 %d 字节", n), 1)
+}
+
+// sendCommand sends a quick-command string through the normal pipeline.
+func (a *app) sendCommand(v string) {
+	a.sendText = v
+	a.sendNow()
+}
+
+func (a *app) writePort(data []byte) (int, error) {
+	a.portMu.Lock()
+	defer a.portMu.Unlock()
+	if a.port == nil {
+		return 0, fmt.Errorf("串口未打开")
+	}
+	return a.port.Write(data)
 }
 
 // periodicLoop resends the configured payload while periodic send is on.
@@ -567,16 +578,17 @@ func (a *app) periodicLoop() {
 		if err != nil {
 			continue
 		}
-		a.portMu.Lock()
-		if a.port != nil {
-			if n, err := a.port.Write(data); err == nil {
-				w := a.win.Load()
-				if w != nil {
-					w.Update(func() { a.txCount += n })
-				}
+		n, err := a.writePort(data)
+		if err == nil && n > 0 {
+			if w := a.win.Load(); w != nil {
+				w.Update(func() {
+					a.txCount += n
+					if a.showTX {
+						a.appendRecord(dirTX, data)
+					}
+				})
 			}
 		}
-		a.portMu.Unlock()
 	}
 }
 
