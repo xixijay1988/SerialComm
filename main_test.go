@@ -179,24 +179,24 @@ func TestAppendRecordMergesLineAcrossReads(t *testing.T) {
 	if len(s.rxRecords) != 3 || string(s.rxRecords[2].data) != "ghijkl\r\n" {
 		t.Fatalf("records = %#v", s.rxRecords)
 	}
-	// A lone line terminator after a completed line folds into that
-	// record instead of becoming an empty row (e.g. "abc\r\n" + "\n").
+	// A terminator after a completed line is a real empty line: it
+	// keeps its own record so intentional blank lines are not lost.
 	s.appendRecord(dirRX, []byte("uvw\r\n"))
 	s.appendRecord(dirRX, []byte("\n"))
 	s.appendRecord(dirRX, []byte("xyz\r\n"))
-	if len(s.rxRecords) != 5 {
-		t.Fatalf("records = %d, want 5", len(s.rxRecords))
+	if len(s.rxRecords) != 6 {
+		t.Fatalf("records = %d, want 6", len(s.rxRecords))
 	}
-	if got := string(s.rxRecords[3].data); got != "uvw\r\n\n" {
-		t.Fatalf("record 3 = %q", got)
+	if got := string(s.rxRecords[4].data); got != "\n" {
+		t.Fatalf("record 4 = %q, want empty line", got)
 	}
-	if got := string(s.rxRecords[4].data); got != "xyz\r\n" {
-		t.Fatalf("record 4 = %q", got)
+	if got := string(s.rxRecords[5].data); got != "xyz\r\n" {
+		t.Fatalf("record 5 = %q", got)
 	}
 	// TX records never merge: two sends stay two rows.
 	s.appendRecord(dirTX, []byte("AT"))
 	s.appendRecord(dirTX, []byte("OK"))
-	if len(s.rxRecords) != 7 {
-		t.Fatalf("records = %d, want 7", len(s.rxRecords))
+	if len(s.rxRecords) != 8 {
+		t.Fatalf("records = %d, want 8", len(s.rxRecords))
 	}
 }

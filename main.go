@@ -518,40 +518,25 @@ func (s *session) readLoop(p serial.Port) {
 // becoming an empty or partial row.
 func (s *session) appendRecord(dir int, data []byte) {
 	for len(data) > 0 {
-		merged := false
 		if n := len(s.rxRecords); n > 0 {
 			last := &s.rxRecords[n-1]
-			if last.dir == dir && dir == dirRX && len(last.data) < maxRecordBytes {
-				var m int
-				if len(last.data) == 0 || last.data[len(last.data)-1] != '\n' {
-					// Unfinished line: continue it up to the next newline.
-					m = maxRecordBytes - len(last.data)
-					if m > len(data) {
-						m = len(data)
-					}
-					if i := bytes.IndexByte(data[:m], '\n'); i >= 0 {
-						m = i + 1
-					}
-				} else {
-					// Completed line: absorb only a leading run of line
-					// terminators — a '\n' or "\r\n" stranded by a read
-					// boundary must not become an empty row.
-					for m < len(data) && (data[m] == '\r' || data[m] == '\n') {
-						m++
-					}
-					if room := maxRecordBytes - len(last.data); m > room {
-						m = room
-					}
+			// An unfinished line continues; a \r\n split across reads is
+			// one line ending, not a line plus an empty one. A terminator
+			// after a completed line is a real empty line and keeps its
+			// own record.
+			if last.dir == dir && dir == dirRX && len(last.data) < maxRecordBytes &&
+				(len(last.data) == 0 || last.data[len(last.data)-1] != '\n') {
+				m := maxRecordBytes - len(last.data)
+				if m > len(data) {
+					m = len(data)
 				}
-				if m > 0 {
-					last.data = append(last.data, data[:m]...)
-					data = data[m:]
-					merged = true
+				if i := bytes.IndexByte(data[:m], '\n'); i >= 0 {
+					m = i + 1
 				}
+				last.data = append(last.data, data[:m]...)
+				data = data[m:]
+				continue
 			}
-		}
-		if merged {
-			continue
 		}
 		n := len(data)
 		if i := bytes.IndexByte(data, '\n'); i >= 0 {
