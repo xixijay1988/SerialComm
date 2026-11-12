@@ -136,13 +136,16 @@ type app struct {
 	showSide bool
 
 	// right panel / commands
-	showPanel  bool
-	rightTab   int
-	cmdGroup   string
-	customCmds map[string][]quickCmd
-	addOpen    bool
-	addName    string
-	addValue   string
+	showPanel   bool
+	rightTab    int
+	cmdGroup    string
+	customCmds  map[string][]quickCmd
+	addOpen     bool
+	addName     string
+	addValue    string
+	addHex      bool
+	addSuffix   string
+	addChecksum string
 
 	themeMode int // 0 system, 1 light, 2 dark
 	dark      bool
@@ -713,6 +716,11 @@ func (s *session) sendNow() {
 		s.setStatus("发送失败: "+err.Error(), 2)
 		return
 	}
+	s.sendData(data)
+}
+
+// sendData writes payload bytes, counts them and echoes a TX record.
+func (s *session) sendData(data []byte) {
 	n, err := s.writePort(data)
 	if err != nil {
 		s.setStatus("发送失败: "+err.Error(), 2)
@@ -723,10 +731,18 @@ func (s *session) sendNow() {
 	s.setStatus(fmt.Sprintf("已发送 %d 字节", n), 1)
 }
 
-// sendCommand sends a quick-command string through the normal pipeline.
-func (s *session) sendCommand(v string) {
-	s.sendText = v
-	s.sendNow()
+// sendCommand sends a quick command with its own send options; the
+// send area's HEX/suffix/checksum settings do not apply.
+func (s *session) sendCommand(cmd quickCmd) {
+	data, err := payload(sendSnap{
+		text: cmd.Value, hex: cmd.Hex,
+		suffix: cmd.Suffix, checksum: cmd.Checksum,
+	})
+	if err != nil {
+		s.setStatus("发送失败: "+err.Error(), 2)
+		return
+	}
+	s.sendData(data)
 }
 
 func (s *session) writePort(data []byte) (int, error) {

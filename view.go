@@ -367,10 +367,10 @@ func (a *app) viewComposer(c *ui.Context, s *session) {
 	ui.Column(c).Background(p.surface).Children(func() {
 		ui.Row(c).AlignItems(ui.Center).Padding(2, 12, 0, 12).
 			Children(func() {
-			ui.Tabs(c, &s.composeTab, "单条发送", "文件发送", "高级封包")
-			ui.Spacer(c).Grow(1)
-			ui.Text(c, "⌘↵ 发送").FontSize(10).TextColor(p.faint)
-		})
+				ui.Tabs(c, &s.composeTab, "单条发送", "文件发送", "高级封包")
+				ui.Spacer(c).Grow(1)
+				ui.Text(c, "⌘↵ 发送").FontSize(10).TextColor(p.faint)
+			})
 		if s.composeTab == 0 {
 			a.viewSendRow(c, s)
 		} else {
@@ -426,9 +426,9 @@ func (a *app) viewPanel(c *ui.Context, s *session) {
 		} else {
 			ui.Row(c).Padding(20).AlignItems(ui.Center).Grow(1).
 				Children(func() {
-				ui.Text(c, "规划中 —— 该功能尚未实现").
-					FontSize(11).TextColor(p.muted).Grow(1)
-			})
+					ui.Text(c, "规划中 —— 该功能尚未实现").
+						FontSize(11).TextColor(p.muted).Grow(1)
+				})
 		}
 	})
 }
@@ -454,12 +454,15 @@ func (a *app) viewCommands(c *ui.Context, s *session) {
 			ui.Button(c, "＋ 添加快捷命令").OnClick(func() {
 				a.addOpen = true
 				a.addName, a.addValue = "", ""
+				a.addHex = false
+				a.addSuffix = sfxCRLF
+				a.addChecksum = "None"
 			})
 		}
 		ui.Column(c).Gap(4).Padding(8).Background(p.surface2).
 			Radius(6).Border(1, p.line).Children(func() {
 			ui.Text(c, "提示").FontSize(10).Bold().TextColor(p.gold)
-			ui.Text(c, "命令按当前发送选项（HEX / 行尾 / 校验）发送；"+
+			ui.Text(c, "每条命令自带发送选项（HEX / 行尾 / 校验）；"+
 				"自定义命令保存在内存中。").
 				FontSize(10).TextColor(p.muted)
 		})
@@ -475,10 +478,15 @@ func (a *app) viewCmdCard(c *ui.Context, i int, cmd quickCmd, s *session) {
 			ui.Textf(c, "#%02d", i+1).FontSize(9.5).TextColor(p.faint)
 			ui.Text(c, cmd.Title).FontSize(11).Bold().Grow(1).NoWrap()
 			ui.Button(c, "发送").Disabled(!s.opened).
-				OnClick(func() { s.sendCommand(cmd.Value) })
+				OnClick(func() { s.sendCommand(cmd) })
 		})
-		ui.Text(c, cmd.Value).FontSize(10).Font("monospace").
-			TextColor(p.muted).NoWrap()
+		ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+			ui.Text(c, cmd.Value).FontSize(10).Font("monospace").
+				TextColor(p.muted).Grow(1).NoWrap()
+			if b := cmd.badges(); b != "" {
+				ui.Text(c, b).FontSize(9).TextColor(p.faint).NoWrap()
+			}
+		})
 	})
 }
 
@@ -489,6 +497,13 @@ func (a *app) viewAddForm(c *ui.Context) {
 		Border(1, p.line).Children(func() {
 		ui.TextInput(c, &a.addName).Placeholder("命令名称")
 		ui.TextInput(c, &a.addValue).Placeholder("命令内容")
+		ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+			ui.Checkbox(c, &a.addHex, "HEX")
+			ui.Text(c, "行尾").FontSize(11).TextColor(p.muted).NoWrap()
+			ui.Select(c, &a.addSuffix, suffixes).MinWidth(90).Grow(1)
+			ui.Text(c, "校验").FontSize(11).TextColor(p.muted).NoWrap()
+			ui.Select(c, &a.addChecksum, checksums).MinWidth(90).Grow(1)
+		})
 		ui.Row(c).Gap(6).Children(func() {
 			ui.Button(c, "确定").OnClick(func() {
 				if a.addValue == "" {
@@ -503,7 +518,9 @@ func (a *app) viewAddForm(c *ui.Context) {
 				}
 				a.customCmds[a.cmdGroup] = append(
 					a.customCmds[a.cmdGroup],
-					quickCmd{Title: name, Value: a.addValue})
+					quickCmd{Title: name, Value: a.addValue,
+						Hex: a.addHex, Suffix: a.addSuffix,
+						Checksum: a.addChecksum})
 				a.addOpen = false
 			})
 			ui.Button(c, "取消").OnClick(func() { a.addOpen = false })

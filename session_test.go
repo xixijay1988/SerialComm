@@ -5,6 +5,9 @@ import (
 	"math/rand"
 	"strings"
 	"testing"
+	"time"
+
+	serial "go.bug.st/serial"
 )
 
 func TestSessions(t *testing.T) {
@@ -27,11 +30,11 @@ func TestSessions(t *testing.T) {
 
 func TestParseInterval(t *testing.T) {
 	cases := map[string]int64{
-		"500 ms":  500,
-		"1000":    1000,
+		"500 ms": 500,
+		"1000":   1000,
 		"250 毫秒": 250,
-		"":        0, // empty must not panic
-		"abc ms":  0,
+		"":       0, // empty must not panic
+		"abc ms": 0,
 	}
 	for in, want := range cases {
 		if got := parseInterval(in).Milliseconds(); got != want {
@@ -260,7 +263,7 @@ func TestPortInUse(t *testing.T) {
 
 func TestGroupCommands(t *testing.T) {
 	a := newTestApp()
-	a.customCmds[a.cmdGroup] = []quickCmd{{"mine", "mycmd"}}
+	a.customCmds[a.cmdGroup] = []quickCmd{{Title: "mine", Value: "mycmd"}}
 	got := a.groupCommands()
 	if len(got) != len(cmdGroups[a.cmdGroup])+1 || got[len(got)-1].Value != "mycmd" {
 		t.Fatalf("groupCommands = %#v", got)
@@ -277,5 +280,84 @@ func TestSendNowNoPort(t *testing.T) {
 	}
 	if s.status != "发送失败: 串口未打开" {
 		t.Fatalf("status = %q", s.status)
+	}
+}
+
+// fakePort is a serial.Port that captures writes for assertions.
+type fakePort struct {
+	written [][]byte
+}
+
+func (f *fakePort) SetMode(*serial.Mode) error { return nil }
+func (f *fakePort) Read([]byte) (int, error)   { return 0, nil }
+func (f *fakePort) Drain() error               { return nil }
+func (f *fakePort) ResetInputBuffer() error    { return nil }
+func (f *fakePort) ResetOutputBuffer() error   { return nil }
+func (f *fakePort) SetDTR(bool) error          { return nil }
+func (f *fakePort) SetRTS(bool) error          { return nil }
+func (f *fakePort) GetModemStatusBits() (*serial.ModemStatusBits, error) {
+	return &serial.ModemStatusBits{}, nil
+}
+func (f *fakePort) SetReadTimeout(time.Duration) error { return nil }
+func (f *fakePort) Close() error                       { return nil }
+func (f *fakePort) Break(time.Duration) error          { return nil }
+func (f *fakePort) Write(p []byte) (int, error) {
+	f.written = append(f.written, append([]byte{}, p...))
+	return len(p), nil
+}
+
+func TestSendCommandOwnConfig(t *testing.T) {
+	a := newTestApp()
+	s := a.activeSession()
+	fp := &fakePort{}
+	s.port = fp
+	s.opened = true
+
+	// A Modbus-style command sends hex + CRC regardless of the send
+	// area's text-mode settings.
+	s.sendHex = false
+	s.suffix = "CRLF (\\r\\n)"
+	s.sendCommand(quickCmd{Title: "read", Value: "01 03 00 00 00 02",
+		Hex: true, Checksum: "CRC16-Modbus"})
+	if len(fp.written) != 1 {
+		t.Fatalf("writes = %d, want 1", len(fp.written))
+	}
+	got := fp.written[0]
+	want := appendChecksum([]byte{0x01, 0x03, 0x00, 0x00, 0x00, 0x02},
+		"CRC16-Modbus")
+	if !bytes.Equal(got, want) {
+		t.Fatalf("sent % X, want % X", got, want)
+	}
+	if s.txCount != len(want) {
+		t.Fatalf("txCount = %d", s.txCount)
+	}
+	// The TX echo shows the bytes sent.
+	if len(s.rxRecords) != 1 || s.rxRecords[0].dir != dirTX ||
+		!bytes.Equal(s.rxRecords[0].data, want) {
+		t.Fatalf("records = %#v", s.rxRecords)
+	}
+
+	// A text command with its own CRLF suffix.
+	s.sendCommand(quickCmd{Title: "at", Value: "AT", Suffix: "CRLF (\\r\\n)"})
+	if len(fp.written) != 2 || string(fp.written[1]) != "AT\r\n" {
+		t.Fatalf("second write = % X", fp.written)
+	}
+
+	// A command whose hex content is invalid fails before writing.
+	s.sendCommand(quickCmd{Title: "bad", Value: "ZZ", Hex: true})
+	if len(fp.written) != 2 {
+		t.Fatalf("bad hex wrote %d frames", len(fp.written))
+	}
+}
+
+func TestQuickCmdBadges(t *testing.T) {
+	if got := (quickCmd{Value: "AT", Suffix: "CRLF (\\r\\n)"}).badges(); got != "CRLF" {
+		t.Fatalf("badges = %q", got)
+	}
+	if got := (quickCmd{Hex: true, Checksum: "CRC16-Modbus"}).badges(); got != "HEX · CRC16-Modbus" {
+		t.Fatalf("badges = %q", got)
+	}
+	if got := (quickCmd{}).badges(); got != "" {
+		t.Fatalf("empty badges = %q", got)
 	}
 }
