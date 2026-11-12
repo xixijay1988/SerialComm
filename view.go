@@ -320,7 +320,8 @@ func (a *app) viewConsole(c *ui.Context, s *session) {
 	p := a.pal()
 	s.filterRecords()
 	s.rxList.FollowEnd = s.autofollow
-	ui.Column(c).Basis(0).Grow(1).MinHeight(0).Background(p.consoleBg).Children(func() {
+	ui.Column(c).Basis(0).Grow(1).MinHeight(0).Background(p.consoleBg).
+		Selectable().Children(func() {
 		ui.List(c, &s.rxList, len(s.filtered), func(i int) {
 			r := s.filtered[i]
 			tag, col := a.dirTag(r.dir)
