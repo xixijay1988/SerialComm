@@ -7,7 +7,7 @@ in pure Go with [MyGo](https://github.com/egoist/mygo) native UI
 (GPU-rendered, no webview, no cgo) and
 [go.bug.st/serial](https://go.bug.st/serial).
 
-![SerialComm](docs/screenshot.png)
+![SerialComm](docs/screenshot-dark.png)
 
 <details><summary>Light theme</summary>
 

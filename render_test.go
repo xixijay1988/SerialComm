@@ -61,7 +61,7 @@ func TestRenderScreenshot(t *testing.T) {
 	for _, dark := range []bool{true, false} {
 		a.dark = dark
 		img := ui.Render(a.view, 1280, 800, 2)
-		name := "docs/screenshot.png"
+		name := "docs/screenshot-dark.png"
 		if !dark {
 			name = "docs/screenshot-light.png"
 		}
