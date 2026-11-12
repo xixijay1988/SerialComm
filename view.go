@@ -1,9 +1,7 @@
 package main
 
 import (
-	"fmt"
-	"strings"
-
+	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
 )
 
@@ -37,9 +35,9 @@ func labeledField(c *ui.Context, p palette, label string, build func()) ui.Eleme
 	})
 }
 
-func (a *app) statusColor() ui.Color {
-	p := a.pal()
-	switch a.statusKind {
+func (s *session) statusColor() ui.Color {
+	p := s.a.pal()
+	switch s.statusKind {
 	case 1:
 		return p.green
 	case 2:
@@ -48,229 +46,332 @@ func (a *app) statusColor() ui.Color {
 	return p.muted
 }
 
+// themeLabel shows the appearance mode: follow system, light, dark.
+func (a *app) themeLabel() string {
+	switch a.themeMode {
+	case 1:
+		return "☀ 浅色"
+	case 2:
+		return "☾ 深色"
+	}
+	return "◐ 跟随系统"
+}
+
+// cycleTheme rotates 跟随系统 → 浅色 → 深色.
+func (a *app) cycleTheme() {
+	a.themeMode = (a.themeMode + 1) % 3
+	switch a.themeMode {
+	case 1:
+		mygo.Theme.SetSource(mygo.ThemeLight)
+		a.dark = false
+	case 2:
+		mygo.Theme.SetSource(mygo.ThemeDark)
+		a.dark = true
+	default:
+		mygo.Theme.SetSource(mygo.ThemeSystem)
+		a.dark = mygo.Theme.IsDark()
+	}
+}
+
 func (a *app) view(c *ui.Context) {
 	p := a.pal()
+	s := a.activeSession()
 	c.OnShortcut(ui.Cmd, ui.KeyEnter, func() {
-		if a.opened && a.composeTab == 0 {
-			a.sendNow()
+		if s != nil && s.opened && s.composeTab == 0 {
+			s.sendNow()
 		}
 	})
 	c.OnShortcut(ui.Cmd, ui.KeyK, func() { a.wantFocus = true })
 
 	ui.Themed(c, proTheme(a.dark)).Children(func() {
 		ui.Column(c).Fill().Background(p.bg).FontSize(12).Children(func() {
-			a.viewTopBar(c)
+			a.viewTopBar(c, s)
 			hdiv(c, p)
 			ui.Row(c).Grow(1).Children(func() {
+				if a.showSide {
+					a.viewSidebar(c)
+					ui.Column(c).Width(1).FillHeight().Background(p.line)
+				}
 				ui.Column(c).Grow(1).MinWidth(0).FillHeight().Children(func() {
-					a.viewConfig(c)
+					if s == nil {
+						return
+					}
+					a.viewConfig(c, s)
 					hdiv(c, p)
-					a.viewConsoleHead(c)
+					a.viewConsoleHead(c, s)
 					hdiv(c, p)
-					a.viewConsole(c)
+					a.viewConsole(c, s)
 					hdiv(c, p)
-					a.viewConsoleBottom(c)
+					a.viewConsoleBottom(c, s)
 					hdiv(c, p)
-					a.viewComposer(c)
+					a.viewComposer(c, s)
 				})
 				if a.showPanel {
 					ui.Column(c).Width(1).FillHeight().Background(p.line)
-					a.viewPanel(c)
+					a.viewPanel(c, s)
 				}
 			})
 			hdiv(c, p)
-			a.viewStatusBar(c)
+			a.viewStatusBar(c, s)
 		})
 	})
 }
 
-// viewTopBar renders the brand row with the session tab and theme toggle.
-func (a *app) viewTopBar(c *ui.Context) {
+// viewTopBar renders the sidebar toggle, brand, session tab and theme
+// switch.
+func (a *app) viewTopBar(c *ui.Context, s *session) {
 	p := a.pal()
-	ui.Row(c).Height(44).Padding(0, 14).Gap(10).AlignItems(ui.Center).
+	ui.Row(c).Height(44).Padding(0, 12).Gap(10).AlignItems(ui.Center).
 		Background(p.surface).Children(func() {
+		ui.Toggle(c, &a.showSide, "☰").Tooltip("工作区")
 		ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
 			ui.Text(c, "SerialComm").FontSize(14).Bold()
 			pill(c, p, "PRO", ui.Hex("#ffffff"), p.accent2)
 		})
 		vdiv(c, p)
-		// Session tab: dot + device name.
+		// Session tab: dot + name.
 		ui.Row(c).Gap(6).AlignItems(ui.Center).Padding(4, 10).
 			Background(p.surface3).Radius(6).Children(func() {
 			dcol := p.faint
-			if a.opened {
-				dcol = p.green
+			label := "未连接"
+			if s != nil {
+				label = s.name
+				if s.opened {
+					dcol = p.green
+				}
 			}
 			dot(c, dcol)
-			name := "未连接"
-			if a.opened {
-				name = a.devName
-			}
-			ui.Text(c, name).FontSize(11).TextColor(p.text).NoWrap()
+			ui.Text(c, label).FontSize(11).TextColor(p.text).NoWrap()
 		})
 		ui.Spacer(c).Grow(1)
 		ui.Text(c, "串口调试工作台").FontSize(10).TextColor(p.muted)
-		themeLabel := "☀ 浅色"
-		if !a.dark {
-			themeLabel = "☾ 深色"
-		}
-		ui.Button(c, themeLabel).FontSize(10.5).OnClick(func() {
-			a.dark = !a.dark
+		ui.Button(c, a.themeLabel()).FontSize(10.5).OnClick(a.cycleTheme)
+	})
+}
+
+// viewSidebar renders the workspace column: session list + device card.
+func (a *app) viewSidebar(c *ui.Context) {
+	p := a.pal()
+	ui.Column(c).Width(184).FillHeight().Background(p.surface).Children(func() {
+		ui.Row(c).Padding(10, 12, 6, 12).AlignItems(ui.Center).Children(func() {
+			ui.Text(c, "工作区").FontSize(10).Bold().TextColor(p.muted)
+			ui.Spacer(c).Grow(1)
+			ui.Text(c, "串口调试").FontSize(9.5).TextColor(p.faint)
 		})
+		ui.Text(c, "活动会话").FontSize(9).TextColor(p.faint).
+			Padding(2, 12, 4, 12)
+		ui.Scroll(c).Grow(1).Children(func() {
+			ui.Column(c).Gap(2).Padding(0, 6).Children(func() {
+				for i, s := range a.sessions {
+					a.viewSessionRow(c, i, s)
+				}
+				ui.Row(c).Padding(6, 8).AlignItems(ui.Center).
+					Role(ui.RoleButton).Children(func() {
+					ui.Text(c, "＋ 新建会话").FontSize(11).TextColor(p.muted)
+				}).OnClick(func() { a.newSession() })
+			})
+		})
+		hdiv(c, p)
+		// Bottom: current device card.
+		ui.Column(c).Gap(4).Padding(10, 12).Children(func() {
+			ui.Text(c, "当前设备").FontSize(9).TextColor(p.faint)
+			s := a.activeSession()
+			var pi *portInfo
+			if s != nil {
+				pi = s.selectedPort()
+			}
+			ui.Column(c).Gap(4).Padding(8).Background(p.surface3).
+				Radius(6).Border(1, p.line).Children(func() {
+				if pi == nil {
+					ui.Text(c, "无可用串口").FontSize(11).TextColor(p.muted)
+					return
+				}
+				ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+					dcol := p.faint
+					if s.opened {
+						dcol = p.green
+					}
+					dot(c, dcol)
+					ui.Text(c, pi.Base).FontSize(11).Bold().NoWrap().Grow(1)
+				})
+				ui.Text(c, pi.Name).FontSize(9.5).Font("monospace").
+					TextColor(p.muted).NoWrap()
+				info := pi.Chip
+				if pi.VID != "" {
+					info += "  " + pi.VID + ":" + pi.PID
+				}
+				if info != "" {
+					ui.Text(c, info).FontSize(9.5).TextColor(p.faint).NoWrap()
+				}
+			})
+			ui.Text(c, "⌘↵ 发送  ·  ⌘K 搜索").FontSize(9).
+				TextColor(p.faint)
+		})
+	})
+}
+
+// viewSessionRow renders one session entry in the sidebar: a button to
+// switch, with a separate close button beside it.
+func (a *app) viewSessionRow(c *ui.Context, i int, s *session) {
+	p := a.pal()
+	ui.Row(c).Gap(2).AlignItems(ui.Center).Children(func() {
+		row := ui.Row(c).Gap(6).Padding(5, 8).AlignItems(ui.Center).
+			Radius(6).Grow(1).Role(ui.RoleButton)
+		if i == a.active {
+			row.Background(p.surface3)
+		}
+		row.OnClick(func() { a.active = i })
+		row.Children(func() {
+			dcol := p.faint
+			if s.opened {
+				dcol = p.green
+			}
+			dot(c, dcol)
+			ui.Column(c).Gap(1).Grow(1).MinWidth(0).Children(func() {
+				ui.Text(c, s.name).FontSize(11).TextColor(p.text).NoWrap()
+				sub := "未连接"
+				if s.opened {
+					sub = s.devName
+				} else if pi := s.selectedPort(); pi != nil {
+					sub = pi.Base
+				}
+				ui.Text(c, sub).FontSize(9).TextColor(p.faint).NoWrap()
+			})
+		})
+		if len(a.sessions) > 1 {
+			ui.Button(c, "×").FontSize(10).Tooltip("关闭会话").
+				OnClick(func() { a.closeSession(i) })
+		}
 	})
 }
 
 // viewConfig renders the serial parameter row.
-func (a *app) viewConfig(c *ui.Context) {
+func (a *app) viewConfig(c *ui.Context, s *session) {
 	p := a.pal()
-	ui.Row(c).Gap(10).AlignItems(ui.End).Padding(10, 14).
+	ui.Row(c).Gap(8).AlignItems(ui.End).Padding(8, 10).Wrap().
 		Background(p.surface).Children(func() {
 		labeledField(c, p, "串口设备", func() {
 			ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
-				ui.Select(c, &a.portSel, a.portLabels()).
-					MinWidth(190).Disabled(a.opened)
-				ui.Button(c, "⟳").Tooltip("刷新设备列表").
+				ui.Select(c, &s.portSel, a.portLabels()).
+					MinWidth(150).Disabled(s.opened)
+				ui.Button(c, "刷新").FontSize(10).Tooltip("刷新设备列表").
 					OnClick(a.refreshPortsAsync)
 			})
-		})
+		}).Shrink(1)
 		labeledField(c, p, "波特率", func() {
-			ui.Combobox(c, &a.baud, baudRates).MinWidth(100).
-				OnChange(a.applyMode)
-		})
+			ui.Combobox(c, &s.baud, baudRates).MinWidth(84).
+				OnChange(s.applyMode)
+		}).Shrink(1)
 		labeledField(c, p, "数据位", func() {
-			ui.Select(c, &a.dataBits, []string{"5", "6", "7", "8"}).
-				MinWidth(64).OnChange(a.applyMode)
+			ui.Select(c, &s.dataBits, []string{"5", "6", "7", "8"}).
+				MinWidth(58).OnChange(s.applyMode)
 		})
 		labeledField(c, p, "校验", func() {
-			ui.Select(c, &a.parity,
+			ui.Select(c, &s.parity,
 				[]string{"None", "Odd", "Even", "Mark", "Space"}).
-				MinWidth(80).OnChange(a.applyMode)
+				MinWidth(72).OnChange(s.applyMode)
 		})
 		labeledField(c, p, "停止位", func() {
-			ui.Select(c, &a.stopBits, []string{"1", "1.5", "2"}).
-				MinWidth(64).OnChange(a.applyMode)
+			ui.Select(c, &s.stopBits, []string{"1", "1.5", "2"}).
+				MinWidth(58).OnChange(s.applyMode)
 		})
 		ui.Spacer(c).Grow(1)
-		ui.Row(c).Gap(5).AlignItems(ui.Center).Children(func() {
-			ui.Switch(c, &a.dtr).OnChange(a.setModemBits)
-			ui.Text(c, "DTR").FontSize(10.5).TextColor(p.muted)
+		ui.Row(c).Gap(4).AlignItems(ui.Center).Children(func() {
+			ui.Switch(c, &s.dtr).OnChange(s.setModemBits)
+			ui.Text(c, "DTR").FontSize(10).TextColor(p.muted)
 		})
-		ui.Row(c).Gap(5).AlignItems(ui.Center).Children(func() {
-			ui.Switch(c, &a.rts).OnChange(a.setModemBits)
-			ui.Text(c, "RTS").FontSize(10.5).TextColor(p.muted)
+		ui.Row(c).Gap(4).AlignItems(ui.Center).Children(func() {
+			ui.Switch(c, &s.rts).OnChange(s.setModemBits)
+			ui.Text(c, "RTS").FontSize(10).TextColor(p.muted)
 		})
 		label := "连接设备"
-		if a.opened {
+		if s.opened {
 			label = "断开连接"
 		}
-		ui.PrimaryButton(c, label).MinWidth(96).OnClick(a.togglePort)
+		ui.PrimaryButton(c, label).MinWidth(92).OnClick(s.togglePort)
 	})
 }
 
 // viewConsoleHead renders the console toolbar.
-func (a *app) viewConsoleHead(c *ui.Context) {
+func (a *app) viewConsoleHead(c *ui.Context, s *session) {
 	p := a.pal()
-	ui.Row(c).Gap(8).AlignItems(ui.Center).Padding(6, 12).
+	ui.Row(c).Gap(8).AlignItems(ui.Center).Padding(6, 12).Wrap().
 		Background(p.surface2).Children(func() {
-		ui.Text(c, "串口监视器").FontSize(12).Bold()
-		ui.Segmented(c, &a.dispMode, "文本", "HEX", "混合")
-		ui.Toggle(c, &a.showRX, "RX")
-		ui.Toggle(c, &a.showTX, "TX")
+		ui.Text(c, "串口监视器").FontSize(12).Bold().NoWrap()
+		ui.Segmented(c, &s.dispMode, "文本", "HEX", "混合")
+		ui.Toggle(c, &s.showRX, "RX")
+		ui.Toggle(c, &s.showTX, "TX")
 		pill(c, p, "UTF-8", p.muted, p.surface3)
 		ui.Spacer(c).Grow(1)
-		ui.Checkbox(c, &a.showTS, "时间戳")
-		ui.SearchField(c, &a.query).MinWidth(140).
+		ui.Checkbox(c, &s.showTS, "时间戳")
+		ui.SearchField(c, &s.query).MinWidth(110).
 			Placeholder("搜索日志… ⌘K").Bind(&a.searchH)
 		if a.wantFocus {
 			a.searchH.Focus(c)
 			a.wantFocus = false
 		}
-		ui.Button(c, "⤒ 导出").Tooltip("保存日志到文件").OnClick(a.saveLog)
-		ui.Toggle(c, &a.showPanel, "☰")
+		ui.Button(c, "导出").Tooltip("保存日志到文件").OnClick(s.saveLog)
+		ui.Toggle(c, &a.showPanel, "☷").Tooltip("快捷命令面板")
 	})
 }
 
-// dirTag returns the label and color for a record direction.
-func (a *app) dirTag(dir int) (string, ui.Color) {
-	p := a.pal()
-	switch dir {
-	case dirTX:
-		return "TX", p.tx
-	case dirSYS:
-		return "SYS", p.sys
-	}
-	return "RX", p.rx
-}
-
 // viewConsole renders the log list.
-func (a *app) viewConsole(c *ui.Context) {
+func (a *app) viewConsole(c *ui.Context, s *session) {
 	p := a.pal()
-	a.filterRecords()
-	a.rxList.FollowEnd = a.autofollow
+	s.filterRecords()
+	s.rxList.FollowEnd = s.autofollow
 	ui.Column(c).Grow(1).Background(p.consoleBg).Children(func() {
-		ui.List(c, &a.rxList, len(a.filtered), func(i int) {
-		r := a.filtered[i]
-		tag, col := a.dirTag(r.dir)
-		ui.Row(c).Gap(10).Padding(1, 12).AlignItems(ui.Start).
-			Font("monospace").Children(func() {
-			if a.showTS {
-				ui.Text(c, r.ts.Format("15:04:05.000")).
-					FontSize(10.5).TextColor(p.logTime).NoWrap()
-			}
-			ui.Text(c, tag).FontSize(9.5).Bold().TextColor(col).
-				NoWrap().MinWidth(24)
-			ui.Text(c, a.recordText(r)).FontSize(11.5).
-				TextColor(p.logMsg).Grow(1)
-		})
-	}).Grow(1)
+		ui.List(c, &s.rxList, len(s.filtered), func(i int) {
+			r := s.filtered[i]
+			tag, col := a.dirTag(r.dir)
+			ui.Row(c).Gap(10).Padding(1, 12).AlignItems(ui.Start).
+				Font("monospace").Children(func() {
+				if s.showTS {
+					ui.Text(c, r.ts.Format("15:04:05.000")).
+						FontSize(10.5).TextColor(p.logTime).NoWrap()
+				}
+				ui.Text(c, tag).FontSize(9.5).Bold().TextColor(col).
+					NoWrap().MinWidth(24)
+				ui.Text(c, s.recordText(r)).FontSize(11.5).
+					TextColor(p.logMsg).Grow(1)
+			})
+		}).Grow(1)
 	})
 }
 
 // viewConsoleBottom renders follow/pause and log actions.
-func (a *app) viewConsoleBottom(c *ui.Context) {
+func (a *app) viewConsoleBottom(c *ui.Context, s *session) {
 	p := a.pal()
 	ui.Row(c).Gap(10).AlignItems(ui.Center).Padding(5, 12).
 		Background(p.surface2).Children(func() {
-		ui.Toggle(c, &a.autofollow, "跟随输出")
-		ui.Toggle(c, &a.paused, "暂停显示")
-		ui.Textf(c, "已显示 %d 行", len(a.filtered)).FontSize(10).
+		ui.Toggle(c, &s.autofollow, "跟随输出")
+		ui.Toggle(c, &s.paused, "暂停显示")
+		ui.Textf(c, "已显示 %d 行", len(s.filtered)).FontSize(10).
 			TextColor(p.muted)
 		ui.Spacer(c).Grow(1)
 		svc := c.Services()
 		ui.Button(c, "复制").Tooltip("复制全部日志").
-			OnClick(func() { a.copyLog(svc) })
+			OnClick(func() { s.copyLog(svc) })
 		ui.Button(c, "清空").OnClick(func() {
-			a.rxRecords = a.rxRecords[:0]
-			a.rxCount, a.txCount = 0, 0
+			s.rxRecords = s.rxRecords[:0]
+			s.rxCount, s.txCount = 0, 0
 		})
-		ui.Button(c, "保存日志").OnClick(a.saveLog)
+		ui.Button(c, "保存日志").OnClick(s.saveLog)
 	})
 }
 
-// copyLog copies the rendered log to the clipboard.
-func (a *app) copyLog(svc ui.Services) {
-	var s strings.Builder
-	for _, r := range a.rxRecords {
-		tag, _ := a.dirTag(r.dir)
-		fmt.Fprintf(&s, "[%s] %s %s\n",
-			r.ts.Format("15:04:05.000"), tag, a.recordText(r))
-	}
-	svc.WriteClipboard(s.String())
-	a.setStatus("日志已复制到剪贴板", 1)
-}
-
 // viewComposer renders the send area with tabs and options.
-func (a *app) viewComposer(c *ui.Context) {
+func (a *app) viewComposer(c *ui.Context, s *session) {
 	p := a.pal()
 	ui.Column(c).Background(p.surface).Children(func() {
 		ui.Row(c).AlignItems(ui.Center).Padding(2, 12, 0, 12).
 			Children(func() {
-			ui.Tabs(c, &a.composeTab, "单条发送", "文件发送", "高级封包")
+			ui.Tabs(c, &s.composeTab, "单条发送", "文件发送", "高级封包")
 			ui.Spacer(c).Grow(1)
 			ui.Text(c, "⌘↵ 发送").FontSize(10).TextColor(p.faint)
 		})
-		if a.composeTab == 0 {
-			a.viewSendRow(c)
+		if s.composeTab == 0 {
+			a.viewSendRow(c, s)
 		} else {
 			ui.Row(c).Padding(18).AlignItems(ui.Center).Children(func() {
 				ui.Text(c, "规划中 —— 该功能尚未实现，敬请期待").
@@ -281,46 +382,46 @@ func (a *app) viewComposer(c *ui.Context) {
 }
 
 // viewSendRow renders the textarea, send button, and option row.
-func (a *app) viewSendRow(c *ui.Context) {
+func (a *app) viewSendRow(c *ui.Context, s *session) {
 	p := a.pal()
 	ui.Row(c).Gap(10).Padding(8, 12).AlignItems(ui.Stretch).Children(func() {
-		ui.TextArea(c, &a.sendText).Grow(1).MinHeight(64).
+		ui.TextArea(c, &s.sendText).Grow(1).MinHeight(64).
 			Font("monospace").FontSize(12).
 			Placeholder("输入要发送的数据…（HEX 模式下按十六进制解析）").
-			OnChange(a.updateSnap)
+			OnChange(s.updateSnap)
 		ui.PrimaryButton(c, "发送 ↗").FillHeight().MinWidth(88).
-			Disabled(!a.opened).OnClick(a.sendNow)
+			Disabled(!s.opened).OnClick(s.sendNow)
 	})
 	ui.Row(c).Gap(10).AlignItems(ui.Center).Padding(4, 12, 10, 12).
-		Children(func() {
-		ui.Checkbox(c, &a.sendHex, "HEX 发送").OnChange(a.updateSnap)
+		Wrap().Children(func() {
+		ui.Checkbox(c, &s.sendHex, "HEX 发送").OnChange(s.updateSnap)
 		vdiv(c, p)
-		ui.Text(c, "行结束").FontSize(10.5).TextColor(p.muted)
-		ui.Select(c, &a.suffix, suffixes).MinWidth(100).
-			OnChange(a.updateSnap)
+		ui.Text(c, "行结束").FontSize(10.5).TextColor(p.muted).NoWrap()
+		ui.Select(c, &s.suffix, suffixes).MinWidth(100).
+			OnChange(s.updateSnap)
 		vdiv(c, p)
-		ui.Checkbox(c, &a.periodic, "定时发送").OnChange(a.updateSnap)
-		ui.Select(c, &a.interval, intervals).MinWidth(96).
-			OnChange(a.updateSnap)
+		ui.Checkbox(c, &s.periodic, "定时发送").OnChange(s.updateSnap)
+		ui.Select(c, &s.interval, intervals).MinWidth(96).
+			OnChange(s.updateSnap)
 		vdiv(c, p)
-		ui.Text(c, "校验").FontSize(10.5).TextColor(p.muted)
-		ui.Select(c, &a.checksum, checksums).MinWidth(124).
-			OnChange(a.updateSnap)
+		ui.Text(c, "校验").FontSize(10.5).TextColor(p.muted).NoWrap()
+		ui.Select(c, &s.checksum, checksums).MinWidth(124).
+			OnChange(s.updateSnap)
 		ui.Spacer(c).Grow(1)
-		ui.Text(c, a.status).FontSize(10.5).TextColor(a.statusColor()).
+		ui.Text(c, s.status).FontSize(10.5).TextColor(s.statusColor()).
 			NoWrap()
 	})
 }
 
 // viewPanel renders the right-side command panel.
-func (a *app) viewPanel(c *ui.Context) {
+func (a *app) viewPanel(c *ui.Context, s *session) {
 	p := a.pal()
-	ui.Column(c).Width(280).Background(p.surface).Children(func() {
+	ui.Column(c).Width(264).Background(p.surface).Children(func() {
 		ui.Column(c).Padding(4, 10, 0, 10).Children(func() {
 			ui.Tabs(c, &a.rightTab, "多条发送", "自动回复", "小工具")
 		})
 		if a.rightTab == 0 {
-			a.viewCommands(c)
+			a.viewCommands(c, s)
 		} else {
 			ui.Row(c).Padding(20).AlignItems(ui.Center).Grow(1).
 				Children(func() {
@@ -332,7 +433,7 @@ func (a *app) viewPanel(c *ui.Context) {
 }
 
 // viewCommands renders the quick-command group and its cards.
-func (a *app) viewCommands(c *ui.Context) {
+func (a *app) viewCommands(c *ui.Context, s *session) {
 	p := a.pal()
 	ui.Column(c).Gap(8).Padding(10).Grow(1).Children(func() {
 		ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
@@ -342,7 +443,7 @@ func (a *app) viewCommands(c *ui.Context) {
 		ui.Scroll(c).Grow(1).Children(func() {
 			ui.Column(c).Gap(8).Children(func() {
 				for i, cmd := range a.groupCommands() {
-					a.viewCmdCard(c, i, cmd)
+					a.viewCmdCard(c, i, cmd, s)
 				}
 			})
 		})
@@ -365,15 +466,15 @@ func (a *app) viewCommands(c *ui.Context) {
 }
 
 // viewCmdCard renders one quick-command card.
-func (a *app) viewCmdCard(c *ui.Context, i int, cmd quickCmd) {
+func (a *app) viewCmdCard(c *ui.Context, i int, cmd quickCmd, s *session) {
 	p := a.pal()
 	ui.Column(c).Gap(4).Padding(8).Background(p.surface3).Radius(6).
 		Border(1, p.line).Children(func() {
 		ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
 			ui.Textf(c, "#%02d", i+1).FontSize(9.5).TextColor(p.faint)
 			ui.Text(c, cmd.Title).FontSize(11).Bold().Grow(1).NoWrap()
-			ui.Button(c, "发送").Disabled(!a.opened).
-				OnClick(func() { a.sendCommand(cmd.Value) })
+			ui.Button(c, "发送").Disabled(!s.opened).
+				OnClick(func() { s.sendCommand(cmd.Value) })
 		})
 		ui.Text(c, cmd.Value).FontSize(10).Font("monospace").
 			TextColor(p.muted).NoWrap()
@@ -410,36 +511,38 @@ func (a *app) viewAddForm(c *ui.Context) {
 }
 
 // viewStatusBar renders the bottom status row.
-func (a *app) viewStatusBar(c *ui.Context) {
+func (a *app) viewStatusBar(c *ui.Context, s *session) {
 	p := a.pal()
 	ui.Row(c).Height(28).Padding(0, 14).Gap(14).AlignItems(ui.Center).
 		Background(p.surface2).FontSize(10.5).Children(func() {
 		dcol := p.faint
 		state := "已断开"
-		if a.opened {
+		if s != nil && s.opened {
 			dcol = p.green
 			state = "已连接"
 		}
 		ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
 			dot(c, dcol)
 			ui.Text(c, state).TextColor(p.text)
-			if a.opened {
-				ui.Text(c, a.devName).TextColor(p.faint).NoWrap()
+			if s != nil && s.opened {
+				ui.Text(c, s.devName).TextColor(p.faint).NoWrap()
 			}
 		})
-		ui.Textf(c, "RX %d B", a.rxCount).TextColor(p.muted)
-		ui.Textf(c, "TX %d B", a.txCount).TextColor(p.muted)
-		ui.Textf(c, "速率 %s bps", a.baud).TextColor(p.muted)
+		if s != nil {
+			ui.Textf(c, "RX %d B", s.rxCount).TextColor(p.muted)
+			ui.Textf(c, "TX %d B", s.txCount).TextColor(p.muted)
+			ui.Textf(c, "速率 %s bps", s.baud).TextColor(p.muted)
+		}
 		ui.Spacer(c).Grow(1)
-		if a.opened {
+		if s != nil && s.opened {
 			ui.Row(c).Gap(10).AlignItems(ui.Center).Children(func() {
 				ui.Row(c).Gap(4).AlignItems(ui.Center).Children(func() {
 					ui.Text(c, "CTS").TextColor(p.muted)
-					dot(c, modemColor(a.cts, p))
+					dot(c, modemColor(s.cts, p))
 				})
 				ui.Row(c).Gap(4).AlignItems(ui.Center).Children(func() {
 					ui.Text(c, "DSR").TextColor(p.muted)
-					dot(c, modemColor(a.dsr, p))
+					dot(c, modemColor(s.dsr, p))
 				})
 			})
 		}

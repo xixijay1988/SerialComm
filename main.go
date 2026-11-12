@@ -56,13 +56,15 @@ type sendSnap struct {
 	interval time.Duration
 }
 
-// app is the state the window shows. All fields are touched on the main
-// thread only, except pending/snap which are mutex protected.
-type app struct {
-	win atomic.Pointer[mygo.Window]
+// session is one serial connection with its own console and composer
+// state. Fields are touched on the main thread only, except pending/snap
+// which are mutex protected.
+type session struct {
+	a    *app
+	id   int
+	name string
 
 	// port configuration
-	ports    []portInfo
 	portSel  string
 	baud     string
 	dataBits string
@@ -79,24 +81,20 @@ type app struct {
 	cts     bool
 	dsr     bool
 
-	refreshing atomic.Bool
-
 	// console
-	rxList    ui.ListState
-	rxRecords []rxRecord
-	filtered  []rxRecord
-	nextRecID int
-	dispMode  int // 0 text, 1 hex, 2 mixed
-	showRX    bool
-	showTX    bool
-	showTS    bool
-	paused    bool
+	rxList     ui.ListState
+	rxRecords  []rxRecord
+	filtered   []rxRecord
+	nextRecID  int
+	dispMode   int // 0 text, 1 hex, 2 mixed
+	showRX     bool
+	showTX     bool
+	showTS     bool
+	paused     bool
 	autofollow bool
-	query     string
-	searchH   ui.Handle
-	wantFocus bool
-	rxCount   int
-	txCount   int
+	query      string
+	rxCount    int
+	txCount    int
 
 	rxMu      sync.Mutex // guards pending + scheduled
 	pending   []byte
@@ -111,8 +109,27 @@ type app struct {
 	interval   string
 	composeTab int
 
-	snapMu sync.Mutex // guards snap
-	snap   sendSnap
+	snapMu       sync.Mutex // guards snap + lastPeriodic
+	snap         sendSnap
+	lastPeriodic time.Time
+
+	status     string
+	statusKind int // 0 muted, 1 success, 2 danger
+}
+
+// app is the window state: the shared port list, the session set, and
+// app-level UI preferences.
+type app struct {
+	win atomic.Pointer[mygo.Window]
+
+	ports      []portInfo
+	refreshing atomic.Bool
+
+	sessMu   sync.RWMutex // guards sessions
+	sessions []*session
+	active   int
+	nextSID  int
+	showSide bool
 
 	// right panel / commands
 	showPanel  bool
@@ -123,44 +140,42 @@ type app struct {
 	addName    string
 	addValue   string
 
-	dark       bool
-	status     string
-	statusKind int // 0 muted, 1 success, 2 danger
+	themeMode int // 0 system, 1 light, 2 dark
+	dark      bool
+
+	searchH   ui.Handle
+	wantFocus bool
 }
 
 func main() {
 	a := &app{
-		baud:       "115200",
-		dataBits:   "8",
-		parity:     "None",
-		stopBits:   "1",
-		dtr:        true,
-		rts:        true,
-		suffix:     "None",
-		checksum:   "None",
-		interval:   "1000 ms",
-		showRX:     true,
-		showTX:     true,
-		autofollow: true,
+		showSide:   true,
 		showPanel:  true,
 		dark:       true,
 		cmdGroup:   cmdGroupNames[0],
 		customCmds: map[string][]quickCmd{},
-		status:     "请选择串口设备",
 	}
+	a.newSession()
 	a.setPorts(listPortsQuick())
 	go a.watchPorts()
 	go a.periodicLoop()
 	mygo.App.WhenReady(func() {
 		a.win.Store(mygo.NewWindow(mygo.WindowOptions{
 			Title:     "SerialComm",
-			Width:     1180,
-			Height:    760,
-			MinWidth:  900,
-			MinHeight: 620,
+			Width:     1280,
+			Height:    800,
+			MinWidth:  1060,
+			MinHeight: 660,
 			StateKey:  "main",
 			Content:   ui.View(a.view),
 		}))
+		mygo.Theme.SetSource(mygo.ThemeSystem)
+		a.dark = mygo.Theme.IsDark()
+		mygo.Theme.OnUpdated(func() {
+			if w := a.win.Load(); w != nil {
+				w.Update(func() { a.dark = mygo.Theme.IsDark() })
+			}
+		})
 		// Enrich the port list with USB details once the window exists.
 		a.refreshPortsAsync()
 	})
@@ -181,29 +196,104 @@ func (a *app) portLabels() []string {
 	return labels
 }
 
-// --- port management -------------------------------------------------
+// --- sessions ---------------------------------------------------------
 
-// setPorts replaces the port list and fixes the selection. Pure — runs on
-// the main thread.
-func (a *app) setPorts(ports []portInfo) {
-	a.ports = ports
-	found := false
+func (a *app) newSession() *session {
+	a.nextSID++
+	s := &session{
+		a:          a,
+		id:         a.nextSID,
+		baud:       "115200",
+		dataBits:   "8",
+		parity:     "None",
+		stopBits:   "1",
+		dtr:        true,
+		rts:        true,
+		suffix:     "None",
+		checksum:   "None",
+		interval:   "1000 ms",
+		showRX:     true,
+		showTX:     true,
+		autofollow: true,
+		status:     "请选择串口设备",
+	}
+	s.name = fmt.Sprintf("会话 %d", s.id)
+	a.sessMu.Lock()
+	a.sessions = append(a.sessions, s)
+	a.sessMu.Unlock()
+	a.active = len(a.sessions) - 1
+	if a.portSelValid(s) == false && len(a.ports) > 0 {
+		s.portSel = a.ports[0].label()
+	}
+	return s
+}
+
+// portSelValid reports whether the session's selection still exists.
+func (a *app) portSelValid(s *session) bool {
 	for _, p := range a.ports {
-		if p.label() == a.portSel {
-			found = true
+		if p.label() == s.portSel {
+			return true
 		}
 	}
-	if !found && len(a.ports) > 0 {
-		a.portSel = a.ports[0].label()
+	return false
+}
+
+// closeSession removes the session, closing its port first.
+func (a *app) closeSession(i int) {
+	if len(a.sessions) <= 1 {
+		return
 	}
-	if len(a.ports) == 0 {
-		a.portSel = ""
+	s := a.sessions[i]
+	s.closePort()
+	a.sessMu.Lock()
+	a.sessions = append(a.sessions[:i], a.sessions[i+1:]...)
+	a.sessMu.Unlock()
+	if a.active >= len(a.sessions) {
+		a.active = len(a.sessions) - 1
+	}
+}
+
+// eachSession iterates the sessions under the read lock, for background
+// goroutines. The main thread may read a.sessions directly.
+func (a *app) eachSession(fn func(*session)) {
+	a.sessMu.RLock()
+	defer a.sessMu.RUnlock()
+	for _, s := range a.sessions {
+		fn(s)
+	}
+}
+
+// activeSession returns the session shown in the main area.
+func (a *app) activeSession() *session {
+	if len(a.sessions) == 0 {
+		return nil
+	}
+	if a.active >= len(a.sessions) {
+		a.active = len(a.sessions) - 1
+	}
+	return a.sessions[a.active]
+}
+
+// --- port management -------------------------------------------------
+
+// setPorts replaces the port list and fixes session selections.
+// Main thread only.
+func (a *app) setPorts(ports []portInfo) {
+	a.ports = ports
+	for _, s := range a.sessions {
+		if !a.portSelValid(s) {
+			if len(a.ports) > 0 {
+				s.portSel = a.ports[0].label()
+			} else {
+				s.portSel = ""
+			}
+		}
 	}
 }
 
 // refreshPortsAsync runs the slow ioreg-enriched enumeration off the main
-// thread, then applies it and detects unplug of the open port. Safe to
-// call from anywhere; concurrent calls collapse into one.
+// thread, then applies it and detects unplug of open ports. Safe to call
+// from anywhere; concurrent calls collapse into one.
 func (a *app) refreshPortsAsync() {
 	if !a.refreshing.CompareAndSwap(false, true) {
 		return
@@ -216,12 +306,13 @@ func (a *app) refreshPortsAsync() {
 			return
 		}
 		w.Update(func() {
-			gone := a.opened && !portNameListed(ports, a.devName)
 			a.setPorts(ports)
-			if gone {
-				a.closePort()
-				a.setStatus("端口已被拔出", 2)
-				a.sysLog("port removed: " + a.devName)
+			for _, s := range a.sessions {
+				if s.opened && !portNameListed(ports, s.devName) {
+					s.closePort()
+					s.setStatus("端口已被拔出", 2)
+					s.sysLog("port removed: " + s.devName)
+				}
 			}
 		})
 	}()
@@ -246,15 +337,15 @@ func (a *app) watchPorts() {
 			last = names
 			a.refreshPortsAsync()
 		}
-		a.pollModemBits()
+		a.eachSession(func(s *session) { s.pollModemBits() })
 	}
 }
 
 // pollModemBits reads CTS/DSR while the port is open.
-func (a *app) pollModemBits() {
-	a.portMu.Lock()
-	p := a.port
-	a.portMu.Unlock()
+func (s *session) pollModemBits() {
+	s.portMu.Lock()
+	p := s.port
+	s.portMu.Unlock()
 	if p == nil {
 		return
 	}
@@ -262,137 +353,153 @@ func (a *app) pollModemBits() {
 	if err != nil {
 		return
 	}
-	if w := a.win.Load(); w != nil {
+	if w := s.a.win.Load(); w != nil {
 		w.Update(func() {
-			a.cts = bits.CTS
-			a.dsr = bits.DSR
+			s.cts = bits.CTS
+			s.dsr = bits.DSR
 		})
 	}
 }
 
-func (a *app) selectedPort() *portInfo {
-	for i := range a.ports {
-		if a.ports[i].label() == a.portSel {
-			return &a.ports[i]
+// selectedPort returns the port the session's selector points at.
+func (s *session) selectedPort() *portInfo {
+	for i := range s.a.ports {
+		if s.a.ports[i].label() == s.portSel {
+			return &s.a.ports[i]
 		}
 	}
 	return nil
 }
 
-func (a *app) togglePort() {
-	if a.opened {
-		a.closePort()
-		a.setStatus("已断开", 0)
-		a.sysLog("串口已断开")
+// portInUse reports whether another session holds this device open.
+func (a *app) portInUse(name string, except *session) *session {
+	for _, s := range a.sessions {
+		if s != except && s.opened && s.devName == name {
+			return s
+		}
+	}
+	return nil
+}
+
+func (s *session) togglePort() {
+	a := s.a
+	if s.opened {
+		s.closePort()
+		s.setStatus("已断开", 0)
+		s.sysLog("串口已断开")
 		return
 	}
-	p := a.selectedPort()
+	p := s.selectedPort()
 	if p == nil {
-		a.setStatus("未选择串口", 2)
+		s.setStatus("未选择串口", 2)
 		return
 	}
-	mode, err := portMode(a.baud, a.dataBits, a.parity, a.stopBits)
+	if other := a.portInUse(p.Name, s); other != nil {
+		s.setStatus(fmt.Sprintf("端口已被 %s 占用", other.name), 2)
+		return
+	}
+	mode, err := portMode(s.baud, s.dataBits, s.parity, s.stopBits)
 	if err != nil {
-		a.setStatus(err.Error(), 2)
+		s.setStatus(err.Error(), 2)
 		return
 	}
 	port, err := serial.Open(p.Name, mode)
 	if err != nil {
-		a.setStatus("打开失败: "+err.Error(), 2)
+		s.setStatus("打开失败: "+err.Error(), 2)
 		return
 	}
-	a.portMu.Lock()
-	a.port = port
-	a.opened = true
-	a.devName = p.Name
-	a.portMu.Unlock()
-	_ = port.SetDTR(a.dtr)
-	_ = port.SetRTS(a.rts)
-	a.setStatus(fmt.Sprintf("已连接 %s @ %d bps", p.Base, mode.BaudRate), 1)
-	a.sysLog(fmt.Sprintf("串口已打开 %s @ %d bps, %s/%s/%s",
-		p.Name, mode.BaudRate, a.dataBits, a.parity, a.stopBits))
-	go a.readLoop(port)
+	s.portMu.Lock()
+	s.port = port
+	s.opened = true
+	s.devName = p.Name
+	s.portMu.Unlock()
+	_ = port.SetDTR(s.dtr)
+	_ = port.SetRTS(s.rts)
+	s.setStatus(fmt.Sprintf("已连接 %s @ %d bps", p.Base, mode.BaudRate), 1)
+	s.sysLog(fmt.Sprintf("串口已打开 %s @ %d bps, %s/%s/%s",
+		p.Name, mode.BaudRate, s.dataBits, s.parity, s.stopBits))
+	go s.readLoop(port)
 }
 
-func (a *app) closePort() {
-	a.portMu.Lock()
-	defer a.portMu.Unlock()
-	if a.port != nil {
-		_ = a.port.Close()
-		a.port = nil
+func (s *session) closePort() {
+	s.portMu.Lock()
+	defer s.portMu.Unlock()
+	if s.port != nil {
+		_ = s.port.Close()
+		s.port = nil
 	}
-	a.opened = false
-	a.cts, a.dsr = false, false
+	s.opened = false
+	s.cts, s.dsr = false, false
 }
 
 // applyMode re-configures the open port after a parameter change.
-func (a *app) applyMode() {
-	a.portMu.Lock()
-	defer a.portMu.Unlock()
-	if a.port == nil {
+func (s *session) applyMode() {
+	s.portMu.Lock()
+	defer s.portMu.Unlock()
+	if s.port == nil {
 		return
 	}
-	mode, err := portMode(a.baud, a.dataBits, a.parity, a.stopBits)
+	mode, err := portMode(s.baud, s.dataBits, s.parity, s.stopBits)
 	if err != nil {
-		a.setStatus(err.Error(), 2)
+		s.setStatus(err.Error(), 2)
 		return
 	}
-	if err := a.port.SetMode(mode); err != nil {
-		a.setStatus("参数设置失败: "+err.Error(), 2)
+	if err := s.port.SetMode(mode); err != nil {
+		s.setStatus("参数设置失败: "+err.Error(), 2)
 		return
 	}
-	a.setStatus(fmt.Sprintf("%d bps", mode.BaudRate), 1)
+	s.setStatus(fmt.Sprintf("%d bps", mode.BaudRate), 1)
 }
 
-func (a *app) setModemBits() {
-	a.portMu.Lock()
-	defer a.portMu.Unlock()
-	if a.port == nil {
+func (s *session) setModemBits() {
+	s.portMu.Lock()
+	defer s.portMu.Unlock()
+	if s.port == nil {
 		return
 	}
-	if err := a.port.SetDTR(a.dtr); err != nil {
-		a.setStatus("DTR: "+err.Error(), 2)
+	if err := s.port.SetDTR(s.dtr); err != nil {
+		s.setStatus("DTR: "+err.Error(), 2)
 	}
-	if err := a.port.SetRTS(a.rts); err != nil {
-		a.setStatus("RTS: "+err.Error(), 2)
+	if err := s.port.SetRTS(s.rts); err != nil {
+		s.setStatus("RTS: "+err.Error(), 2)
 	}
 }
 
 // --- receive ---------------------------------------------------------
 
-func (a *app) readLoop(p serial.Port) {
+func (s *session) readLoop(p serial.Port) {
 	buf := make([]byte, 8192)
 	for {
 		n, err := p.Read(buf)
 		if n > 0 {
-			a.rxMu.Lock()
-			a.pending = append(a.pending, buf[:n]...)
-			need := !a.scheduled
-			a.scheduled = true
-			a.rxMu.Unlock()
+			s.rxMu.Lock()
+			s.pending = append(s.pending, buf[:n]...)
+			need := !s.scheduled
+			s.scheduled = true
+			s.rxMu.Unlock()
 			if need {
-				a.win.Load().Update(func() {
-					a.rxMu.Lock()
-					data := a.pending
-					a.pending = nil
-					a.scheduled = false
-					a.rxMu.Unlock()
-					a.rxCount += len(data)
-					if !a.paused {
-						a.appendRecord(dirRX, data)
+				s.a.win.Load().Update(func() {
+					s.rxMu.Lock()
+					data := s.pending
+					s.pending = nil
+					s.scheduled = false
+					s.rxMu.Unlock()
+					s.rxCount += len(data)
+					if !s.paused {
+						s.appendRecord(dirRX, data)
 					}
 				})
 			}
 		}
 		if err != nil {
-			a.win.Load().Update(func() {
-				a.portMu.Lock()
-				stillOpen := a.opened && a.port == p
-				a.portMu.Unlock()
+			s.a.win.Load().Update(func() {
+				s.portMu.Lock()
+				stillOpen := s.opened && s.port == p
+				s.portMu.Unlock()
 				if stillOpen {
-					a.closePort()
-					a.setStatus("读取错误: "+err.Error(), 2)
-					a.sysLog("read error: " + err.Error())
+					s.closePort()
+					s.setStatus("读取错误: "+err.Error(), 2)
+					s.sysLog("read error: " + err.Error())
 				}
 			})
 			return
@@ -401,26 +508,26 @@ func (a *app) readLoop(p serial.Port) {
 }
 
 // appendRecord adds a console line; main thread only.
-func (a *app) appendRecord(dir int, data []byte) {
-	a.nextRecID++
-	a.rxRecords = append(a.rxRecords, rxRecord{
-		id: a.nextRecID, ts: time.Now(), dir: dir, data: data,
+func (s *session) appendRecord(dir int, data []byte) {
+	s.nextRecID++
+	s.rxRecords = append(s.rxRecords, rxRecord{
+		id: s.nextRecID, ts: time.Now(), dir: dir, data: data,
 	})
-	if len(a.rxRecords) > maxRXRecords {
-		a.rxRecords = a.rxRecords[len(a.rxRecords)-maxRXRecords:]
+	if len(s.rxRecords) > maxRXRecords {
+		s.rxRecords = s.rxRecords[len(s.rxRecords)-maxRXRecords:]
 	}
 }
 
-func (a *app) sysLog(msg string) {
-	a.appendRecord(dirSYS, []byte(msg))
+func (s *session) sysLog(msg string) {
+	s.appendRecord(dirSYS, []byte(msg))
 }
 
 // recordText renders one record under the current display mode.
-func (a *app) recordText(r rxRecord) string {
+func (s *session) recordText(r rxRecord) string {
 	if r.dir == dirSYS {
 		return printable(r.data)
 	}
-	switch a.dispMode {
+	switch s.dispMode {
 	case 1:
 		return hexDump(r.data, 16)
 	case 2:
@@ -436,70 +543,90 @@ func (a *app) recordText(r rxRecord) string {
 }
 
 // filterRecords applies the RX/TX toggles and the search query.
-func (a *app) filterRecords() {
-	q := strings.ToLower(a.query)
-	a.filtered = a.filtered[:0]
-	for _, r := range a.rxRecords {
+func (s *session) filterRecords() {
+	q := strings.ToLower(s.query)
+	s.filtered = s.filtered[:0]
+	for _, r := range s.rxRecords {
 		switch r.dir {
 		case dirRX:
-			if !a.showRX {
+			if !s.showRX {
 				continue
 			}
 		case dirTX:
-			if !a.showTX {
+			if !s.showTX {
 				continue
 			}
 		}
-		if q != "" && !strings.Contains(strings.ToLower(a.recordText(r)), q) {
+		if q != "" && !strings.Contains(strings.ToLower(s.recordText(r)), q) {
 			continue
 		}
-		a.filtered = append(a.filtered, r)
+		s.filtered = append(s.filtered, r)
 	}
 }
 
-func (a *app) saveLog() {
+// dirTag returns the label and color for a record direction.
+func (a *app) dirTag(dir int) (string, ui.Color) {
+	p := a.pal()
+	switch dir {
+	case dirTX:
+		return "TX", p.tx
+	case dirSYS:
+		return "SYS", p.sys
+	}
+	return "RX", p.rx
+}
+
+func (s *session) saveLog() {
 	path, err := mygo.Dialog.Save(mygo.SaveDialogOptions{
-		Parent:      a.win.Load(),
+		Parent:      s.a.win.Load(),
 		Title:       "保存日志",
 		DefaultPath: "serialcomm.log",
 	})
 	if err != nil || path == "" {
 		return
 	}
-	var s strings.Builder
-	for _, r := range a.rxRecords {
-		dir := "RX"
-		if r.dir == dirTX {
-			dir = "TX"
-		} else if r.dir == dirSYS {
-			dir = "SYS"
-		}
-		fmt.Fprintf(&s, "[%s] %s %s\n", r.ts.Format("15:04:05.000"), dir, a.recordText(r))
+	var b strings.Builder
+	for _, r := range s.rxRecords {
+		tag, _ := s.a.dirTag(r.dir)
+		fmt.Fprintf(&b, "[%s] %s %s\n",
+			r.ts.Format("15:04:05.000"), tag, s.recordText(r))
 	}
-	if err := os.WriteFile(path, []byte(s.String()), 0o644); err != nil {
-		a.setStatus("保存失败: "+err.Error(), 2)
+	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
+		s.setStatus("保存失败: "+err.Error(), 2)
 		return
 	}
-	a.setStatus("已保存: "+path, 1)
+	s.setStatus("已保存: "+path, 1)
+}
+
+// copyLog copies the rendered log to the clipboard.
+func (s *session) copyLog(svc ui.Services) {
+	var b strings.Builder
+	for _, r := range s.rxRecords {
+		tag, _ := s.a.dirTag(r.dir)
+		fmt.Fprintf(&b, "[%s] %s %s\n",
+			r.ts.Format("15:04:05.000"), tag, s.recordText(r))
+	}
+	svc.WriteClipboard(b.String())
+	s.setStatus("日志已复制到剪贴板", 1)
 }
 
 // --- send ------------------------------------------------------------
 
-func (a *app) updateSnap() {
-	a.snapMu.Lock()
-	defer a.snapMu.Unlock()
-	a.snap = sendSnap{
-		text:     a.sendText,
-		hex:      a.sendHex,
-		suffix:   a.suffix,
-		checksum: a.checksum,
-		periodic: a.periodic,
-		interval: parseInterval(a.interval),
+func (s *session) updateSnap() {
+	s.snapMu.Lock()
+	defer s.snapMu.Unlock()
+	s.snap = sendSnap{
+		text:     s.sendText,
+		hex:      s.sendHex,
+		suffix:   s.suffix,
+		checksum: s.checksum,
+		periodic: s.periodic,
+		interval: parseInterval(s.interval),
 	}
 }
 
-func parseInterval(s string) time.Duration {
-	n, _ := strconv.Atoi(strings.Fields(s)[0])
+func parseInterval(str string) time.Duration {
+	n, _ := strconv.Atoi(strings.Fields(str)[0])
 	return time.Duration(n) * time.Millisecond
 }
 
@@ -531,67 +658,75 @@ func payload(s sendSnap) ([]byte, error) {
 	return data, nil
 }
 
-func (a *app) sendNow() {
-	a.updateSnap()
-	data, err := payload(a.snap)
+func (s *session) sendNow() {
+	s.updateSnap()
+	data, err := payload(s.snap)
 	if err != nil {
-		a.setStatus("发送失败: "+err.Error(), 2)
+		s.setStatus("发送失败: "+err.Error(), 2)
 		return
 	}
-	n, err := a.writePort(data)
+	n, err := s.writePort(data)
 	if err != nil {
-		a.setStatus("发送失败: "+err.Error(), 2)
+		s.setStatus("发送失败: "+err.Error(), 2)
 		return
 	}
-	a.txCount += n
-	a.appendRecord(dirTX, data)
-	a.setStatus(fmt.Sprintf("已发送 %d 字节", n), 1)
+	s.txCount += n
+	s.appendRecord(dirTX, data)
+	s.setStatus(fmt.Sprintf("已发送 %d 字节", n), 1)
 }
 
 // sendCommand sends a quick-command string through the normal pipeline.
-func (a *app) sendCommand(v string) {
-	a.sendText = v
-	a.sendNow()
+func (s *session) sendCommand(v string) {
+	s.sendText = v
+	s.sendNow()
 }
 
-func (a *app) writePort(data []byte) (int, error) {
-	a.portMu.Lock()
-	defer a.portMu.Unlock()
-	if a.port == nil {
+func (s *session) writePort(data []byte) (int, error) {
+	s.portMu.Lock()
+	defer s.portMu.Unlock()
+	if s.port == nil {
 		return 0, fmt.Errorf("串口未打开")
 	}
-	return a.port.Write(data)
+	return s.port.Write(data)
 }
 
-// periodicLoop resends the configured payload while periodic send is on.
+// periodicLoop resends the configured payload while periodic send is on,
+// independently for each session.
 func (a *app) periodicLoop() {
 	for {
-		a.snapMu.Lock()
-		s := a.snap
-		a.snapMu.Unlock()
-		if !s.periodic || s.interval <= 0 {
-			time.Sleep(200 * time.Millisecond)
-			continue
-		}
-		time.Sleep(s.interval)
-		data, err := payload(s)
-		if err != nil {
-			continue
-		}
-		n, err := a.writePort(data)
-		if err == nil && n > 0 {
-			if w := a.win.Load(); w != nil {
-				w.Update(func() {
-					a.txCount += n
-					if a.showTX {
-						a.appendRecord(dirTX, data)
-					}
-				})
+		time.Sleep(50 * time.Millisecond)
+		now := time.Now()
+		a.eachSession(func(s *session) {
+			s.snapMu.Lock()
+			snap := s.snap
+			due := snap.periodic && snap.interval > 0 &&
+				now.Sub(s.lastPeriodic) >= snap.interval
+			if due {
+				s.lastPeriodic = now
 			}
-		}
+			s.snapMu.Unlock()
+			if !due {
+				return
+			}
+			data, err := payload(snap)
+			if err != nil {
+				return
+			}
+			n, err := s.writePort(data)
+			if err == nil && n > 0 {
+				if w := a.win.Load(); w != nil {
+					w.Update(func() {
+						s.txCount += n
+						if s.showTX {
+							s.appendRecord(dirTX, data)
+						}
+					})
+				}
+			}
+		})
 	}
 }
 
-func (a *app) setStatus(s string, kind int) {
-	a.status, a.statusKind = s, kind
+func (s *session) setStatus(str string, kind int) {
+	s.status, s.statusKind = str, kind
 }

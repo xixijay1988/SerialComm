@@ -8,25 +8,15 @@ import (
 
 // newTestApp returns an app with the same defaults main() uses.
 func newTestApp() *app {
-	return &app{
-		baud:       "115200",
-		dataBits:   "8",
-		parity:     "None",
-		stopBits:   "1",
-		dtr:        true,
-		rts:        true,
-		suffix:     "None",
-		checksum:   "None",
-		interval:   "1000 ms",
-		showRX:     true,
-		showTX:     true,
-		autofollow: true,
+	a := &app{
+		showSide:   true,
 		showPanel:  true,
 		dark:       true,
 		cmdGroup:   cmdGroupNames[0],
 		customCmds: map[string][]quickCmd{},
-		status:     "请选择串口设备",
 	}
+	a.newSession()
+	return a
 }
 
 func TestParseHex(t *testing.T) {
@@ -136,12 +126,32 @@ func TestChipFromName(t *testing.T) {
 // The view runs without a window in tests.
 func TestView(t *testing.T) {
 	a := newTestApp()
-	a.rxRecords = []rxRecord{{id: 1, dir: dirRX, data: []byte("hello")}}
-	tt := ui.NewTester(a.view, 1180, 760)
-	for _, want := range []string{"SerialComm", "PRO", "串口监视器",
-		"已断开", "hello", "多条发送", "快捷命令组", "连接设备"} {
+	s := a.activeSession()
+	s.rxRecords = []rxRecord{{id: 1, dir: dirRX, data: []byte("hello")}}
+	tt := ui.NewTester(a.view, 1280, 800)
+	for _, want := range []string{"SerialComm", "PRO", "工作区", "活动会话",
+		"会话 1", "当前设备", "串口监视器", "已断开", "hello",
+		"多条发送", "快捷命令组", "连接设备", "◐ 跟随系统"} {
 		if !tt.HasText(want) {
 			t.Errorf("expected %q, texts %q", want, tt.Texts())
 		}
+	}
+}
+
+func TestSessions(t *testing.T) {
+	a := newTestApp()
+	s2 := a.newSession()
+	if len(a.sessions) != 2 || a.activeSession() != s2 {
+		t.Fatalf("newSession: sessions=%d active=%d", len(a.sessions), a.active)
+	}
+	a.active = 0
+	a.closeSession(0)
+	if len(a.sessions) != 1 || a.activeSession() != s2 {
+		t.Fatalf("closeSession: sessions=%d active=%d", len(a.sessions), a.active)
+	}
+	// Cannot close the last session.
+	a.closeSession(0)
+	if len(a.sessions) != 1 {
+		t.Fatal("last session was closed")
 	}
 }
