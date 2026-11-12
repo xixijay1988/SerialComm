@@ -155,3 +155,34 @@ func TestSessions(t *testing.T) {
 		t.Fatal("last session was closed")
 	}
 }
+
+func TestAppendRecordMergesLineAcrossReads(t *testing.T) {
+	a := newTestApp()
+	s := a.activeSession()
+	// The device's \r\n line ending lands split across two reads:
+	// "abc\r" then "\ndef\r\n". The merged record must not leave an
+	// empty row behind.
+	s.appendRecord(dirRX, []byte("abc\r"))
+	s.appendRecord(dirRX, []byte("\ndef\r\n"))
+	if len(s.rxRecords) != 2 {
+		t.Fatalf("records = %d, want 2", len(s.rxRecords))
+	}
+	if got := string(s.rxRecords[0].data); got != "abc\r\n" {
+		t.Fatalf("record 0 = %q", got)
+	}
+	if got := string(s.rxRecords[1].data); got != "def\r\n" {
+		t.Fatalf("record 1 = %q", got)
+	}
+	// A following chunk without newline keeps appending to the open line.
+	s.appendRecord(dirRX, []byte("ghi"))
+	s.appendRecord(dirRX, []byte("jkl\r\n"))
+	if len(s.rxRecords) != 3 || string(s.rxRecords[2].data) != "ghijkl\r\n" {
+		t.Fatalf("records = %#v", s.rxRecords)
+	}
+	// TX records never merge: two sends stay two rows.
+	s.appendRecord(dirTX, []byte("AT"))
+	s.appendRecord(dirTX, []byte("OK"))
+	if len(s.rxRecords) != 5 {
+		t.Fatalf("records = %d, want 5", len(s.rxRecords))
+	}
+}

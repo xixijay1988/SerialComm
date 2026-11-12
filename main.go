@@ -513,9 +513,28 @@ func (s *session) readLoop(p serial.Port) {
 
 // appendRecord adds console lines; main thread only. Data is split at
 // newlines so each record is one display line, and capped at
-// maxRecordBytes so a single large read cannot create a giant row.
+// maxRecordBytes so a single large read cannot create a giant row. A
+// line split across reads continues the previous record instead of
+// becoming an empty or partial row.
 func (s *session) appendRecord(dir int, data []byte) {
 	for len(data) > 0 {
+		if n := len(s.rxRecords); n > 0 {
+			last := &s.rxRecords[n-1]
+			open := last.dir == dir && dir == dirRX && len(last.data) < maxRecordBytes &&
+				(len(last.data) == 0 || last.data[len(last.data)-1] != '\n')
+			if open {
+				m := maxRecordBytes - len(last.data)
+				if m > len(data) {
+					m = len(data)
+				}
+				if i := bytes.IndexByte(data[:m], '\n'); i >= 0 {
+					m = i + 1
+				}
+				last.data = append(last.data, data[:m]...)
+				data = data[m:]
+				continue
+			}
+		}
 		n := len(data)
 		if i := bytes.IndexByte(data, '\n'); i >= 0 {
 			n = i + 1
