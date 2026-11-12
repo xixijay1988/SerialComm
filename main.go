@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"log"
 	"os"
@@ -17,7 +18,10 @@ import (
 	"github.com/egoist/mygo/ui"
 )
 
-const maxRXRecords = 2000
+const (
+	maxRXRecords   = 2000
+	maxRecordBytes = 512
+)
 
 var baudRates = []string{
 	"300", "600", "1200", "2400", "4800", "9600", "14400", "19200",
@@ -507,12 +511,24 @@ func (s *session) readLoop(p serial.Port) {
 	}
 }
 
-// appendRecord adds a console line; main thread only.
+// appendRecord adds console lines; main thread only. Data is split at
+// newlines so each record is one display line, and capped at
+// maxRecordBytes so a single large read cannot create a giant row.
 func (s *session) appendRecord(dir int, data []byte) {
-	s.nextRecID++
-	s.rxRecords = append(s.rxRecords, rxRecord{
-		id: s.nextRecID, ts: time.Now(), dir: dir, data: data,
-	})
+	for len(data) > 0 {
+		n := len(data)
+		if i := bytes.IndexByte(data, '\n'); i >= 0 {
+			n = i + 1
+		}
+		if n > maxRecordBytes {
+			n = maxRecordBytes
+		}
+		s.nextRecID++
+		s.rxRecords = append(s.rxRecords, rxRecord{
+			id: s.nextRecID, ts: time.Now(), dir: dir, data: data[:n],
+		})
+		data = data[n:]
+	}
 	if len(s.rxRecords) > maxRXRecords {
 		s.rxRecords = s.rxRecords[len(s.rxRecords)-maxRXRecords:]
 	}
