@@ -83,7 +83,7 @@ func (a *app) view(c *ui.Context) {
 	})
 	c.OnShortcut(ui.Cmd, ui.KeyK, func() { a.wantFocus = true })
 
-	ui.Themed(c, proTheme(a.dark)).Children(func() {
+	ui.Themed(c, proTheme(a.dark)).Fill().Children(func() {
 		ui.Column(c).Fill().Background(p.bg).FontSize(12).Children(func() {
 			a.viewTopBar(c, s)
 			hdiv(c, p)
@@ -417,7 +417,7 @@ func (a *app) viewSendRow(c *ui.Context, s *session) {
 // viewPanel renders the right-side command panel.
 func (a *app) viewPanel(c *ui.Context, s *session) {
 	p := a.pal()
-	ui.Column(c).Width(264).Background(p.surface).Children(func() {
+	ui.Column(c).Width(264).FillHeight().Background(p.surface).Children(func() {
 		ui.Column(c).Padding(4, 10, 0, 10).Children(func() {
 			ui.Tabs(c, &a.rightTab, "多条发送", "自动回复", "小工具")
 		})
