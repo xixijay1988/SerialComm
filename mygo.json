@@ -1,0 +1,6 @@
+{
+  "name": "SerialComm",
+  "identifier": "com.example.serialcomm",
+  "version": "0.1.0",
+  "out": "build"
+}
